@@ -39,9 +39,9 @@ set(LLVM_TOOLS_PLUGINS
 #set(MergeBB_SOURCES
 #  MergeBB.cpp)
 set(ControlDepGraph_SOURCES
-  ControlDepGraph.cpp)
+  ControlDepGraph.cpp helper.cpp GetIfCond.cpp)
 set(VarDefFinder_SOURCES
-  VariableDefinitionFinderPass.cpp)
+  VariableDefinitionFinderPass.cpp helper.cpp)
 
 # CONFIGURE THE PLUGIN LIBRARIES
 # ==============================
@@ -77,3 +77,5 @@ foreach( plugin ${LLVM_TOOLS_PLUGINS} )
       "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>"
       )
 endforeach()
+
+target_link_libraries(ControlDepGraph clang)
