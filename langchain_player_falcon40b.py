@@ -155,8 +155,8 @@ Please adhere to the following guidelines:
 # Initialize variables
 llm_tp, llm_fn, llm_fp, llm_tn = 0, 0, 0, 0
 repo_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3"
-sarif_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
-bitcode_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
+sarif_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
+bitcode_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
 ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
 # Main loop
