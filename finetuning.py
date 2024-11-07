@@ -1,7 +1,7 @@
 import json
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
-from datasets import load_dataset, Dataset
+from datasets import Dataset
 from transformers import DataCollatorForLanguageModeling
 from peft import get_peft_model, LoraConfig, TaskType
 import bitsandbytes as bnb
@@ -18,7 +18,7 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-# **Add this line to set the pad_token**
+# Add this line to set the pad_token
 tokenizer.pad_token = tokenizer.eos_token
 
 # Load the model with 8-bit precision to save memory
@@ -31,7 +31,10 @@ model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True
 )
 
-# **Update the model's config to set the pad_token_id**
+# **Set use_cache to False**
+model.config.use_cache = False
+
+# Update the model's config to set the pad_token_id
 model.config.pad_token_id = tokenizer.eos_token_id
 
 # Apply LoRA for efficient fine-tuning
@@ -71,14 +74,14 @@ def preprocess_function(examples):
         inputs,
         truncation=True,
         max_length=512,  # Adjust based on your data
-        padding='longest',  # **Ensure consistent padding**
+        padding='longest',
         return_tensors='pt'
     )
     tokenized_full_texts = tokenizer(
         full_texts,
         truncation=True,
         max_length=512,  # Adjust based on your data
-        padding='longest',  # **Ensure consistent padding**
+        padding='longest',
         return_tensors='pt'
     )
 
@@ -108,7 +111,7 @@ tokenized_dataset = dataset.map(
     remove_columns=['prompt', 'completion']
 )
 
-# **Set format for PyTorch tensors**
+# Set format for PyTorch tensors
 tokenized_dataset.set_format(type='torch')
 
 # Training arguments
