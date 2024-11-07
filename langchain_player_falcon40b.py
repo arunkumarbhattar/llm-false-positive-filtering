@@ -1,8 +1,8 @@
 import config
 
+from langchain_community.llms import HuggingFacePipeline  # Updated import to langchain-community
 from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain.llms import HuggingFacePipeline
 from langchain.agents import initialize_agent, AgentType, Tool
 from langchain import LLMChain
 from pydantic import BaseModel, Field
@@ -10,13 +10,14 @@ import torch
 import dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-# Load the tokenizer
+# Load the tokenizer with custom cache directory
 tokenizer = AutoTokenizer.from_pretrained(
     config.model_name,
+    cache_dir=config.cache_dir,
     trust_remote_code=True
 )
 
-# Load the model with optional quantization
+# Load the model with optional quantization and custom cache directory
 if config.use_quantization:
     if config.quantization_method == 'bitsandbytes':
         from transformers import BitsAndBytesConfig
@@ -31,15 +32,23 @@ if config.use_quantization:
             quantization_config=quantization_config,
             device_map='auto',
             torch_dtype=config.torch_dtype,
+            cache_dir=config.cache_dir,
             trust_remote_code=True
         )
     elif config.quantization_method == 'gptq':
         # Uncomment and adjust if using GPTQ quantization
+        # from some_gptq_library import GPTQConfig  # Replace with actual import
+
+        # gptq_config = GPTQConfig(
+        #     ...  # Add GPTQ-specific configurations
+        # )
+
         # model = AutoModelForCausalLM.from_pretrained(
         #     config.model_name,
-        #     load_in_4bit=True,
+        #     quantization_config=gptq_config,
         #     device_map='auto',
         #     torch_dtype=config.torch_dtype,
+        #     cache_dir=config.cache_dir,
         #     trust_remote_code=True
         # )
         pass
@@ -50,6 +59,7 @@ else:
         config.model_name,
         device_map='auto',
         torch_dtype=config.torch_dtype,
+        cache_dir=config.cache_dir,
         trust_remote_code=True
     )
 
@@ -58,7 +68,7 @@ text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    device=config.device,
+    device=0 if config.device == 'cuda' else -1,  # HuggingFace uses device indices
     torch_dtype=config.torch_dtype,
     trust_remote_code=True,
     max_length=2048,
@@ -131,6 +141,7 @@ def get_path_constraint(filename: str, lineno: int) -> str:
     """
     return ds.get_path_constraint(filename, lineno)
 
+# Define tools list
 tools = [get_func_definition, variable_def_finder, get_path_constraint]
 
 # Initialize the agent
@@ -198,13 +209,14 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     # Process the response to extract is_bug and explanation
     # You may need to parse the response to get the desired fields
 
-    # For simplicity, we'll assume the agent outputs 'TP' or 'FP' in its response
+    # For simplicity, we'll assume the agent outputs 'True Positive' or 'False Positive' in its response
     if 'True Positive' in response or 'TP' in response:
         is_bug = True
     elif 'False Positive' in response or 'FP' in response:
         is_bug = False
     else:
         # Unable to determine, skip
+        print("Unable to determine classification. Skipping...")
         continue
 
     explanation = response  # Or extract the explanation from the response
@@ -212,8 +224,8 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     llm_decision = {'is_bug': is_bug, 'explanation': explanation}
 
     llm_res = "LLM.BAD" if llm_decision['is_bug'] else "LLM.GOOD"
-    print(gt, llm_res)
-    print(lineno, msg, func, llm_decision['explanation'], '----------------', sep='\n')
+    print(f"Ground Truth: {gt}, LLM Decision: {llm_res}")
+    print(f"Line Number: {lineno}\nMessage: {msg}\nFunction Code:\n{func}\nExplanation: {llm_decision['explanation']}\n----------------\n")
 
     if gt == dataset.GroundTruth.BAD and llm_decision['is_bug']:
         llm_tp += 1
@@ -224,6 +236,6 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     elif gt == dataset.GroundTruth.GOOD and not llm_decision['is_bug']:
         llm_tn += 1
 
-print(f"LLM precision: {llm_tp}/{llm_tp+llm_fp}")
-print(f"LLM recall: {llm_tp}/{llm_tp+llm_fn}")
+print(f"LLM Precision: {llm_tp}/{llm_tp + llm_fp}")
+print(f"LLM Recall: {llm_tp}/{llm_tp + llm_fn}")
 print(f"TP/FP/FN/TN: {llm_tp}/{llm_fp}/{llm_fn}/{llm_tn}")
