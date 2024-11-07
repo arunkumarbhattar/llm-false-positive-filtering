@@ -12,7 +12,7 @@ from datasets import Dataset
 from peft import get_peft_model, LoraConfig, TaskType
 
 # Ensure bitsandbytes is up-to-date
-# You should run the following command in your terminal:
+# Run in terminal:
 # pip install --upgrade bitsandbytes
 
 # Specify the cache directory
@@ -21,8 +21,7 @@ cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/falcon'
 # Define quantization configuration using BitsAndBytesConfig
 quantization_config = BitsAndBytesConfig(
     load_in_8bit=True,
-    llm_int8_threshold=6.0,          # Example parameter; adjust based on your needs
-    llm_int8_has_fp16_weight=True     # Example parameter; adjust based on your needs
+    bnb_8bit_compute_dtype=torch.float16,  # Ensure computations are in float16
 )
 
 # Load the tokenizer without trust_remote_code
@@ -42,9 +41,9 @@ model = AutoModelForCausalLM.from_pretrained(
     model_name,
     cache_dir=cache_dir,
     device_map='auto',
-    torch_dtype=torch.float16,
+    torch_dtype=torch.float32,  # Set to float32 to prevent dtype mismatch
     quantization_config=quantization_config,
-    trust_remote_code=False  # Removed as per your instruction
+    trust_remote_code=False
 )
 
 # **Set use_cache to False to avoid incompatibility with gradient checkpointing**
@@ -119,9 +118,9 @@ def preprocess_function(examples):
         label[:input_len] = [-100] * input_len
         labels.append(label)
 
-    tokenized_inputs['labels'] = labels
+    tokenized_full_texts['labels'] = labels
 
-    return tokenized_inputs
+    return tokenized_full_texts
 
 # Apply the preprocessing
 tokenized_dataset = dataset.map(
@@ -139,22 +138,27 @@ print(f"Number of trainable parameters: {trainable_params}")
 if trainable_params == 0:
     raise ValueError("No trainable parameters found. Check if PEFT is applied correctly.")
 
-# Training arguments
+# **Training arguments with adjustments based on reference code**
 training_args = TrainingArguments(
     output_dir='./fine_tuned_model',
-    per_device_train_batch_size=1,   # Adjust based on your GPU memory
-    gradient_accumulation_steps=8,   # Simulate larger batch size
+    per_device_train_batch_size=1,       # Adjust based on your GPU memory
+    gradient_accumulation_steps=8,       # Simulate larger batch size
     num_train_epochs=3,
-    learning_rate=1e-4,
-    fp16=True,                       # Enable mixed precision
+    learning_rate=3e-5,                  # Adjusted learning rate for stability
+    fp16=False,                          # Disable mixed precision to prevent dtype issues
     logging_steps=10,
     save_steps=100,
     save_total_limit=2,
-    gradient_checkpointing=True,     # Save memory by freeing intermediate activations
-    optim="paged_adamw_8bit",        # Use 8-bit optimizer from bitsandbytes
-    lr_scheduler_type='cosine',      # Learning rate scheduler
-    warmup_steps=100,                # Warm-up steps
-    report_to="none"                 # Disable reporting to avoid unnecessary logs
+    gradient_checkpointing=True,         # Save memory by freeing intermediate activations
+    optim="adamw_torch",                 # Use standard AdamW optimizer
+    lr_scheduler_type='cosine_with_restarts',  # Changed scheduler for better convergence
+    warmup_ratio=0.05,                   # Adjusted warmup steps
+    report_to="none",                    # Disable reporting to avoid unnecessary logs
+    evaluation_strategy="steps",         # Enable evaluation during training
+    eval_steps=100,                      # Evaluate every 100 steps
+    save_strategy="steps",
+    load_best_model_at_end=True,         # Load best model based on evaluation metric
+    metric_for_best_model="loss",        # Use loss as evaluation metric
 )
 
 # Data collator for language modeling
@@ -163,16 +167,18 @@ data_collator = DataCollatorForLanguageModeling(
     mlm=False  # Not using masked language modeling
 )
 
-# Initialize the Trainer without passing the tokenizer (to avoid deprecation warning)
+# **Initialize the Trainer with evaluation and callbacks**
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
+    eval_dataset=tokenized_dataset,  # Using the same dataset for evaluation; replace with a valid eval dataset
     data_collator=data_collator,
+    callbacks=[]  # Add any custom callbacks if needed
 )
 
-# Start training
+# **Start training**
 trainer.train()
 
-# Save the final model
+# **Save the final model**
 trainer.save_model('./fine_tuned_model')
