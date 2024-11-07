@@ -103,16 +103,18 @@ Message: {msg}
 Function code:
 {func_code}
 
-And the following guidance:
+Guidance:
 
-{guidance}
+- {guidance}
 
 Available tools:
+
 - get_func_definition: Get the definition of a function. Use when you need to find a function's code.
 - variable_def_finder: Find where a variable is defined in the code.
 - get_path_constraint: Get the path constraint leading to a specific code line.
 
 Determine which tools to invoke to assist in triaging this bug.
+Provide your answer as a comma-separated list of tool names.
 """.strip(),
 )
 
@@ -204,28 +206,6 @@ The warning at a specific source line is false positive if the variable is alway
     logger.info("Step 1 LLM response received.")
     logger.debug(f"Step 1 Response: {step1_response}")
 
-    step2_prompt_template = PromptTemplate(
-        input_variables=["tool_name", "bug_info", "guidance"],
-        template="""
-    You have decided to call the tool "{tool_name}" based on the following bug information:
-    
-    {bug_info}
-    
-    And the following guidance:
-    
-    {guidance}
-    
-    Now, extract the necessary arguments for the tool "{tool_name}".
-    
-    Provide the arguments in the following format:
-    
-    Args:
-      arg1: value1
-      arg2: value2
-    
-    Replace arg1, arg2, etc., and value1, value2, etc., with the actual argument names and their corresponding values.
-    """.strip(),
-    )
     # Extract tools selected as ground truth
     # Convert it to JSON string
     try:
@@ -263,40 +243,6 @@ The warning at a specific source line is false positive if the variable is alway
     # Extract tool names from tool_calls
     tools_selected = ", ".join([tool_call.get("name", "unknown_tool") for tool_call in tool_calls])
 
-    # Prepare bug_info and guidance as placeholders (replace with actual data as needed)
-    # Define your PromptTemplate for Step 2
-    step2_prompt_template = PromptTemplate(
-        input_variables=["tool_name", "bug_info", "guidance"],
-        template="""
-    You have decided to call the tool "{tool_name}" based on the following bug information:
-    
-    {bug_info}
-    
-    And the following guidance:
-    
-    {guidance}
-    
-    Now, extract the necessary arguments for the tool "{tool_name}".
-    
-    Provide the arguments in the following format:
-    
-    Args:
-      arg1: value1
-      arg2: value2
-      ...
-      
-    Replace arg1, arg2, etc., and value1, value2, etc., with the actual argument names and their corresponding values. You may include as many arguments as necessary for the tool.
-    """.strip(),
-    )
-    # Define markers for context boundaries
-    START_MARKER = "### Bug Start"
-    END_MARKER = "### Bug End"
-
-    # Add start marker for the current bug
-    data.append({
-        "prompt": START_MARKER,
-        "completion": ""
-    })
     # Populate the step1_prompt using the template
     step1_prompt = step1_prompt_template.format(
         bug_type="Potentially uninitialized local variable",
@@ -313,36 +259,6 @@ The warning at a specific source line is false positive if the variable is alway
         "completion": tools_selected
     })
 
-    # Step 2: Provide necessary arguments for the selected tools
-    # Prepare a dictionary to hold tool arguments
-    tools_arguments = {}
-
-    # Step 2: Provide necessary arguments for each selected tool
-    for tool_call in tool_calls:
-        tool_name = tool_call.get("name")
-        args = tool_call.get("args", {})
-
-        if tool_name and args:
-            # Populate the step2_prompt for the current tool
-            step2_prompt = step2_prompt_template.format(
-                tool_name=tool_name,
-                bug_info=bug_info,
-                guidance=guidance
-            )
-
-            # Format the arguments as specified
-            args_formatted = "Args:\n" + "\n".join([f"  {k}: {v}" for k, v in args.items()])
-
-            # Add the prompt-completion pair to the training data
-            data.append({
-                "prompt": step2_prompt,
-                "completion": args_formatted
-            })
-    # Add end marker for the current bug
-    data.append({
-        "prompt": END_MARKER,
-        "completion": ""
-    })
 # Save the data to a JSON Lines file suitable for fine-tuning
 output_file = 'fine_tuning_training_data.jsonl'
 try:

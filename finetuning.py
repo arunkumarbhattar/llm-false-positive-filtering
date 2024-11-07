@@ -1,5 +1,7 @@
 import json
 import os
+import re
+
 import torch
 import argparse
 from transformers import (
@@ -170,35 +172,68 @@ def preprocess_function(examples, tokenizer):
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=128, num_beams=1):
+def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1):
     """
-    Generates completions for the evaluation dataset and computes ROUGE metrics.
-    Also shows ground truth and generated outputs.
+    Generates completions for the evaluation dataset, extracts unique tool names,
+    computes ROUGE metrics, and dumps evaluation details into a JSONL file.
+
+    Args:
+        model: The language model to evaluate.
+        tokenizer: The tokenizer associated with the model.
+        eval_dataset: The evaluation dataset.
+        device (str): The device to run the model on ('cuda' or 'cpu').
+        batch_size (int): Number of samples per batch.
+        max_new_tokens (int): Maximum number of new tokens to generate.
+        num_beams (int): Number of beams for beam search.
+
+    Returns:
+        result (dict): ROUGE scores.
+        generated_completions (list): List of extracted tool names from generated outputs.
+        reference_completions (list): List of expected tool names.
+        prompts (list): List of prompts used for generation.
     """
     # Load ROUGE metric
     rouge = evaluate.load("rouge")
 
+    # Define the list of possible tools
+    possible_tools = [
+        "get_func_definition",
+        "get_path_constraint",
+        "variable_def_finder"
+    ]
+
+    # Create a regex pattern to match any of the possible tools
+    # The pattern ensures full word matching using word boundaries
+    tool_pattern = re.compile(r'\b(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
+
     # Create DataLoader for evaluation
     eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size)
 
+    # Initialize lists to store results
     generated_completions = []
     reference_completions = []
     prompts = []
+    model_outputs = []
+    extracted_outputs = []
 
     model.eval()
     # Note: model.device_map='auto' already handles device placement
 
-    # Modified Generation Parameters
+    # Generation parameters
     generation_kwargs = {
-        "max_new_tokens": 50,  # Reduced to limit output length
-        "num_beams": 1,
+        "max_new_tokens": max_new_tokens,  # Number of new tokens to generate
+        "num_beams": num_beams,
         "early_stopping": True,
         "do_sample": False,
-        "temperature": 0.1,
-        "top_p": 0.9,
-        "top_k": 50,
-        "pad_token_id": tokenizer.eos_token_id
+        "pad_token_id": tokenizer.eos_token_id  # Ensure pad_token_id is set
     }
+
+    # Define the output JSONL file
+    output_jsonl = 'evaluation_details.jsonl'
+
+    # Remove existing JSONL file if it exists to avoid appending to old data
+    if os.path.exists(output_jsonl):
+        os.remove(output_jsonl)
 
     with torch.no_grad():
         for batch in tqdm(eval_dataloader, desc="Generating completions"):
@@ -215,23 +250,40 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 
             # Generate completions
             outputs = model.generate(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 **generation_kwargs
             )
             decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            # Exclude the prompt tokens from the outputs
-            generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
-            response = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+            model_outputs.extend(decoded_preds)
 
-
-            # Get reference completions
-            references = batch['completion']
-
-            # Append to lists
-            generated_completions.extend(decoded_preds)
-            reference_completions.extend(references)
+            # Process each generated completion to extract unique tools
+            processed_completions = []
+            for pred in decoded_preds:
+                # Find all tool matches in the prediction
+                tools_found = tool_pattern.findall(pred)
+                # Get unique tools while preserving order
+                unique_tools = list(dict.fromkeys(tools_found))
+                # Join with commas
+                if unique_tools:
+                    processed_completion = ', '.join(unique_tools)
+                else:
+                    processed_completion = ""  # Assign empty string if no tools found
+                processed_completions.append(processed_completion)
+            extracted_outputs.extend(processed_completions)
+            generated_completions.extend(processed_completions)
+            reference_completions.extend(batch['completion'])
             prompts.extend(prompts_batch)
+
+            # Dump the current batch's details to the JSONL file
+            with open(output_jsonl, 'a') as f:
+                for i in range(len(prompts_batch)):
+                    f.write(json.dumps({
+                        'prompt': prompts_batch[i],
+                        'model_output': decoded_preds[i],
+                        'extracted_output': processed_completions[i],
+                        'expected_output': batch['completion'][i]
+                    }) + '\n')
 
     # Compute ROUGE scores
     result = rouge.compute(predictions=generated_completions, references=reference_completions, use_stemmer=True)
@@ -242,8 +294,9 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # Round the results for readability
     result = {k: round(v, 4) for k, v in result.items()}
 
-    return result, generated_completions, reference_completions, prompts
+    print(f"Saved evaluation details to '{output_jsonl}'")
 
+    return result, generated_completions, reference_completions, prompts
 # --------------------------
 # Function to generate and print sample summaries
 # --------------------------
