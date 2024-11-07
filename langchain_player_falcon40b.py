@@ -10,7 +10,8 @@ from langchain.schema import SystemMessage, HumanMessage, AIMessage
 from langchain.agents import (
     Tool,
     AgentExecutor,
-    create_structured_chat_agent,
+    AgentType,
+    initialize_agent,  # We'll use initialize_agent with the correct AgentType
 )
 from langchain.chains import LLMChain
 from pydantic import BaseModel, Field
@@ -127,11 +128,13 @@ tools = [
     ),
 ]
 
-# Initialize the agent using create_structured_chat_agent
-agent = create_structured_chat_agent(
-    llm=llm,
-    tools=tools,
-    max_iterations=5,
+# Initialize the agent using initialize_agent with AgentType.ZERO_SHOT_REACT_DESCRIPTION
+agent = initialize_agent(
+    tools,
+    llm,
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True,
+    max_iterations=5
 )
 
 # Set up the system prompt
