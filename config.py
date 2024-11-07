@@ -3,7 +3,7 @@
 import torch
 
 # Optimization options
-use_quantization = False  # Set to True to enable quantization
+use_quantization = True  # Enable quantization to reduce memory usage
 quantization_method = 'bitsandbytes'  # Options: 'bitsandbytes', 'gptq'
 
 # Model options
@@ -13,7 +13,7 @@ model_name = 'tiiuae/falcon-40b-instruct'
 device = 'cuda'  # 'cuda' or 'cpu'
 
 # Torch data type
-torch_dtype = torch.bfloat16  # or torch.float16 if bfloat16 is not supported
+torch_dtype = torch.float16  # Use float16 for reduced memory footprint
 
 # Cache directory for HuggingFace models
 cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codeql_llama/'

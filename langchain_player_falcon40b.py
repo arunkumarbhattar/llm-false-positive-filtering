@@ -1,6 +1,6 @@
 import config
 
-from langchain_huggingface import HuggingFacePipeline  # Updated import to langchain-huggingface
+from langchain.llms import HuggingFacePipeline  # Updated import to langchain.llms
 from langchain.prompts.chat import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
@@ -19,14 +19,30 @@ import torch
 import dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
+import logging
+import re
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG for detailed logs
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Load the tokenizer with custom cache directory
+logger.info("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
     config.model_name,
     cache_dir=config.cache_dir,
-    trust_remote_code=True,
+    # trust_remote_code=True,  # Removed to avoid legacy code
 )
+tokenizer.pad_token = tokenizer.eos_token  # Set pad_token if not set
 
 # Load the model with optional quantization and custom cache directory
+logger.info("Loading model...")
 if config.use_quantization:
     if config.quantization_method == 'bitsandbytes':
         from transformers import BitsAndBytesConfig
@@ -39,10 +55,10 @@ if config.use_quantization:
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             quantization_config=quantization_config,
-            device_map='auto',
+            device_map='cuda',  # Explicitly set to 'cuda'
             torch_dtype=config.torch_dtype,
             cache_dir=config.cache_dir,
-            trust_remote_code=True,
+            # trust_remote_code=True,  # Removed to use updated Transformers
         )
     elif config.quantization_method == 'gptq':
         # Uncomment and adjust if using GPTQ quantization
@@ -55,10 +71,10 @@ if config.use_quantization:
         # model = AutoModelForCausalLM.from_pretrained(
         #     config.model_name,
         #     quantization_config=gptq_config,
-        #     device_map='auto',
+        #     device_map='cuda',
         #     torch_dtype=config.torch_dtype,
         #     cache_dir=config.cache_dir,
-        #     trust_remote_code=True,
+        #     # trust_remote_code=True,  # Removed to use updated Transformers
         # )
         pass
     else:
@@ -66,24 +82,28 @@ if config.use_quantization:
 else:
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        device_map='auto',
+        device_map='cuda',  # Explicitly set to 'cuda'
         torch_dtype=config.torch_dtype,
         cache_dir=config.cache_dir,
-        trust_remote_code=True,
+        # trust_remote_code=True,  # Removed to use updated Transformers
     )
 
 # Create a pipeline without specifying the 'device' parameter
+logger.info("Creating text generation pipeline...")
 text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
     # device=0 if config.device == 'cuda' else -1,  # Removed to prevent device conflict
     torch_dtype=config.torch_dtype,
-    trust_remote_code=True,
+    trust_remote_code=False,  # Set to False as per warning
     max_length=2048,
+    truncation=True,  # Explicitly enable truncation
+    padding='max_length',  # Ensure consistent padding
 )
 
 # Create LangChain LLM
+logger.info("Creating LangChain LLM...")
 llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
 # Define tools
@@ -91,6 +111,7 @@ from langchain.tools import Tool
 
 def get_func_definition(func_name: str) -> str:
     """Get the definition of a function."""
+    logger.debug(f"Fetching function definition for: {func_name}")
     res = ds.get_function_definition(func_name)
     if not res or len(res) == 0:
         return f"The definition of {func_name} is unavailable."
@@ -98,10 +119,12 @@ def get_func_definition(func_name: str) -> str:
 
 def variable_def_finder(filename: str, lineno: int, varname: str) -> str:
     """Finds all definitions of a local variable in a specified function within a given file."""
+    logger.debug(f"Finding definitions for variable '{varname}' in {filename} at line {lineno}")
     return ds.variable_def_finder(filename, lineno, varname)
 
 def get_path_constraint(filename: str, lineno: int) -> str:
     """Retrieves the path constraint for a specific source code location."""
+    logger.debug(f"Retrieving path constraint for {filename} at line {lineno}")
     return ds.get_path_constraint(filename, lineno)
 
 tools = [
@@ -129,13 +152,25 @@ tools = [
 ]
 
 # Initialize the agent using initialize_agent with AgentType.ZERO_SHOT_REACT_DESCRIPTION
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=True,
-    max_iterations=5
-)
+logger.info("Initializing the agent...")
+try:
+    agent = initialize_agent(
+        tools,
+        llm,
+        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        verbose=True,
+        max_iterations=5  # Note: If this causes errors, consider removing or updating LangChain
+    )
+except TypeError as e:
+    logger.error(f"Error initializing the agent: {e}")
+    logger.info("Attempting to initialize agent without 'max_iterations'...")
+    agent = initialize_agent(
+        tools,
+        llm,
+        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        verbose=True,
+        # max_iterations=5  # Removed to avoid TypeError
+    )
 
 # Set up the system prompt
 system_prompt = """
@@ -159,9 +194,11 @@ sarif_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-tes
 bitcode_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
 ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
+logger.info("Starting main processing loop...")
 # Main loop
 for srcfile, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
     if not srcfile.endswith("_11.c"):
+        logger.debug(f"Skipping file {srcfile} as it does not end with '_11.c'.")
         continue
     prompt_dict = {
         "bug_type": "Potentially uninitialized local variable",
@@ -186,20 +223,31 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
 
     final_input = f"{system_prompt}\n\n{user_input}"
 
-    # Run the agent
-    response = agent.run(final_input)
-    print("Agent response:")
-    print(response)
-    # Process the response to extract is_bug and explanation
+    logger.info(f"Running agent for file {srcfile} at line {lineno}...")
+    try:
+        # Run the agent using invoke instead of run due to deprecation
+        response = agent.invoke(final_input)
+    except Exception as e:
+        logger.error(f"Error running the agent: {e}")
+        continue
 
-    # For simplicity, we'll assume the agent outputs 'True Positive' or 'False Positive' in its response
-    if 'True Positive' in response or 'TP' in response:
+    logger.info("Agent response received.")
+    logger.debug(f"Response: {response}")
+
+    # Define regex patterns for parsing
+    tp_pattern = re.compile(r'\bTrue Positive\b|\bTP\b', re.IGNORECASE)
+    fp_pattern = re.compile(r'\bFalse Positive\b|\bFP\b', re.IGNORECASE)
+
+    # Parse the response
+    if tp_pattern.search(response):
         is_bug = True
-    elif 'False Positive' in response or 'FP' in response:
+        logger.debug("Parsed response as True Positive.")
+    elif fp_pattern.search(response):
         is_bug = False
+        logger.debug("Parsed response as False Positive.")
     else:
         # Unable to determine, skip
-        print("Unable to determine classification. Skipping...")
+        logger.warning("Unable to determine classification from the response. Skipping...")
         continue
 
     explanation = response  # Use the entire response as the explanation
@@ -207,11 +255,12 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     llm_decision = {'is_bug': is_bug, 'explanation': explanation}
 
     llm_res = "LLM.BAD" if llm_decision['is_bug'] else "LLM.GOOD"
-    print(f"Ground Truth: {gt}, LLM Decision: {llm_res}")
-    print(
+    logger.info(f"Ground Truth: {gt}, LLM Decision: {llm_res}")
+    logger.debug(
         f"Line Number: {lineno}\nMessage: {msg}\nFunction Code:\n{func}\nExplanation: {llm_decision['explanation']}\n----------------\n"
     )
 
+    # Update counters based on ground truth and model decision
     if gt == dataset.GroundTruth.BAD and llm_decision['is_bug']:
         llm_tp += 1
     elif gt == dataset.GroundTruth.BAD and not llm_decision['is_bug']:
@@ -221,6 +270,8 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     elif gt == dataset.GroundTruth.GOOD and not llm_decision['is_bug']:
         llm_tn += 1
 
+# Final evaluation metrics
+logger.info("Processing complete. Calculating evaluation metrics...")
 print(f"LLM Precision: {llm_tp}/{llm_tp + llm_fp}")
 print(f"LLM Recall: {llm_tp}/{llm_tp + llm_fn}")
 print(f"TP/FP/FN/TN: {llm_tp}/{llm_fp}/{llm_fn}/{llm_tn}")
