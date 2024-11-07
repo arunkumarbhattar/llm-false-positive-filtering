@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 from transformers import (
     AutoTokenizer,
@@ -12,8 +13,13 @@ from datasets import Dataset
 from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig, TaskType
 from transformers import TrainerCallback, EarlyStoppingCallback
 import logging
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from tqdm import tqdm
+from datasets import load_metric
 
+# --------------------------
 # Set up logging
+# --------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -128,6 +134,10 @@ print_trainable_parameters(model)
 # Function to load data from JSONL file
 # --------------------------
 def load_jsonl(file_path):
+    """
+    Loads prompt and completion pairs from a JSONL file.
+    Each line in the file should be a JSON object with 'prompt' and 'completion' keys.
+    """
     prompts = []
     completions = []
     with open(file_path, 'r') as f:
@@ -146,7 +156,7 @@ dataset = Dataset.from_dict(data)
 # --------------------------
 # Split the dataset into training and evaluation sets
 # --------------------------
-split_dataset = dataset.train_test_split(test_size=0.2)
+split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
 train_dataset = split_dataset['train']
 eval_dataset = split_dataset['test']
 
@@ -154,6 +164,10 @@ eval_dataset = split_dataset['test']
 # Preprocessing function
 # --------------------------
 def preprocess_function(examples):
+    """
+    Tokenizes the input prompts and completions.
+    Masks the prompt part in the labels to ignore them during loss computation.
+    """
     inputs = examples['prompt']
     outputs = examples['completion']
     full_texts = [inp + out for inp, out in zip(inputs, outputs)]
@@ -213,6 +227,39 @@ tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attentio
 tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
 
 # --------------------------
+# Dump prompt and answer pairs to JSONL files
+# --------------------------
+def dump_prompt_completion(dataset, filename):
+    """
+    Dumps the prompt and completion pairs to a JSONL file.
+    """
+    # Reload the original dataset before mapping to get exact prompts and completions
+    original_prompts = dataset['prompt']
+    original_completions = dataset['completion']
+
+    with open(filename, 'w') as f:
+        for prompt, completion in zip(original_prompts, original_completions):
+            f.write(json.dumps({
+                'prompt': prompt,
+                'completion': completion
+            }) + '\n')
+    print(f"Dumped {len(original_prompts)} samples to {filename}")
+
+# Ensure you have the original dataset before mapping
+# Reload the dataset for dumping
+original_data = load_jsonl('fine_tuning_training_data.jsonl')
+original_dataset = Dataset.from_dict(original_data)
+
+# Split original dataset similarly to ensure consistency
+original_split = original_dataset.train_test_split(test_size=0.2, seed=42)
+original_train = original_split['train']
+original_eval = original_split['test']
+
+# Dump training and evaluation data
+dump_prompt_completion(original_train, 'train_prompt_completion.jsonl')
+dump_prompt_completion(original_eval, 'eval_prompt_completion.jsonl')
+
+# --------------------------
 # Verify that there are trainable parameters
 # --------------------------
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -221,32 +268,63 @@ if trainable_params == 0:
     raise ValueError("No trainable parameters found. Check if PEFT is applied correctly.")
 
 # --------------------------
+# Define evaluation metrics (ROUGE for summarization)
+# --------------------------
+rouge = load_metric("rouge")
+
+def compute_metrics(eval_pred):
+    """
+    Computes ROUGE metrics for summarization tasks.
+    """
+    predictions, labels = eval_pred
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+
+    # Replace -100 in the labels as we set them to ignore in loss computation
+    labels = [
+        [l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels
+    ]
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # Rouge expects newline after each sentence
+    decoded_preds = ["\n".join(pred.strip().split("\n")) for pred in decoded_preds]
+    decoded_labels = ["\n".join(label.strip().split("\n")) for label in decoded_labels]
+
+    result = rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+
+    # Extract the median scores
+    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+    # Add additional metrics if needed
+    return {k: round(v, 4) for k, v in result.items()}
+
+# --------------------------
 # Define training arguments based on reference code
 # --------------------------
 training_args = TrainingArguments(
     output_dir='./fine_tuned_model',
-    per_device_train_batch_size=8,      # Adjust based on your GPU memory
-    per_device_eval_batch_size=8,       # As per reference code
-    gradient_accumulation_steps=8,      # As per reference code
-    num_train_epochs=10,                # As per reference code
-    learning_rate=2e-4,                  # As per reference code
-    weight_decay=0.01,                   # As per reference code
-    logging_dir='./logs',                # Local logging dir
-    logging_steps=100,                   # As per reference code
+    per_device_train_batch_size=8,        # Adjust based on your GPU memory
+    per_device_eval_batch_size=8,         # As per reference code
+    gradient_accumulation_steps=8,        # As per reference code
+    num_train_epochs=10,                   # As per reference code
+    learning_rate=2e-4,                    # As per reference code
+    weight_decay=0.01,                     # As per reference code
+    logging_dir='./logs',                  # Local logging dir
+    logging_steps=100,                     # As per reference code
     save_strategy="steps",
-    save_steps=500,                      # Align with eval_steps
-    save_total_limit=2,                  # As per reference code
+    save_steps=500,                        # Align with eval_steps
+    save_total_limit=2,                    # As per reference code
     evaluation_strategy="steps",
-    eval_steps=500,                      # As per reference code
+    eval_steps=500,                        # As per reference code
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
-    fp16=True,                           # Enable mixed precision
-    optim="adamw_torch",                 # Use standard AdamW optimizer
+    fp16=True,                             # Enable mixed precision
+    optim="adamw_torch",                   # Use standard AdamW optimizer
     lr_scheduler_type="cosine_with_restarts",
-    warmup_ratio=0.05,
-    max_grad_norm=1.0,                    # Added gradient clipping
-    gradient_checkpointing=True,          # As per reference
-    torch_compile=False,                  # As per reference
+    warmup_ratio=0.05,                     # Adjusted warmup steps
+    max_grad_norm=1.0,                     # Added gradient clipping
+    gradient_checkpointing=True,           # As per reference
+    torch_compile=False,                   # As per reference
+    report_to="none",                      # Disabled reporting (removed TensorBoard)
 )
 
 # --------------------------
@@ -275,6 +353,34 @@ class CustomCallback(TrainerCallback):
             logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
 
 # --------------------------
+# Define evaluation metrics (ROUGE for summarization)
+# --------------------------
+def compute_metrics(eval_pred):
+    """
+    Computes ROUGE metrics for summarization tasks.
+    """
+    predictions, labels = eval_pred
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+
+    # Replace -100 in the labels as we set them to ignore in loss computation
+    labels = [
+        [l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels
+    ]
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # Rouge expects newline after each sentence
+    decoded_preds = ["\n".join(pred.strip().split("\n")) for pred in decoded_preds]
+    decoded_labels = ["\n".join(label.strip().split("\n")) for label in decoded_labels]
+
+    result = rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+
+    # Extract the median scores
+    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+    # Add additional metrics if needed
+    return {k: round(v, 4) for k, v in result.items()}
+
+# --------------------------
 # Data collator for language modeling
 # --------------------------
 data_collator = DataCollatorForLanguageModeling(
@@ -291,6 +397,7 @@ trainer = Trainer(
     train_dataset=tokenized_train_dataset,
     eval_dataset=tokenized_eval_dataset,
     data_collator=data_collator,
+    compute_metrics=compute_metrics,  # ROUGE metrics
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3), CustomCallback()],
 )
 
@@ -300,6 +407,72 @@ trainer = Trainer(
 trainer.train()
 
 # --------------------------
-# Save the final model
+# Save the final model to the new directory, creating it if necessary
 # --------------------------
-trainer.save_model('./fine_tuned_model')
+save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_falcon_codeql'
+os.makedirs(save_directory, exist_ok=True)
+trainer.save_model(save_directory)
+print(f"Model saved to {save_directory}")
+
+# --------------------------
+# Perform Evaluation
+# --------------------------
+evaluation_results = trainer.evaluate()
+print("Evaluation Results:")
+print(evaluation_results)
+
+# --------------------------
+# Optional: Generate summaries from the evaluation set
+# --------------------------
+def generate_summary(sample):
+    """
+    Generates a summary for a given sample using the fine-tuned model.
+    """
+    prompt = sample['prompt']
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to('cuda')
+    # Generate summary
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            max_length=512,          # Adjust based on your needs
+            num_beams=4,
+            early_stopping=True,
+            do_sample=False
+        )
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return summary
+
+# Generate summaries for a subset of the evaluation set
+num_samples_to_generate = 5
+print("\nSample Generated Summaries:")
+for i in range(num_samples_to_generate):
+    sample = eval_dataset[i]
+    summary = generate_summary(sample)
+    print(f"\nSample {i+1}:")
+    print("Prompt:")
+    print(sample['prompt'])
+    print("Generated Summary:")
+    print(summary)
+    print("Reference Summary:")
+    print(sample['completion'])
+
+# --------------------------
+# Save evaluation summaries to a JSONL file
+# --------------------------
+def save_evaluation_summaries(dataset, filename, num_samples=100):
+    """
+    Generates and saves summaries for a specified number of samples from the dataset.
+    """
+    with open(filename, 'w') as f:
+        for i in tqdm(range(num_samples), desc=f"Saving summaries to {filename}"):
+            sample = dataset[i]
+            summary = generate_summary(sample)
+            f.write(json.dumps({
+                'prompt': sample['prompt'],
+                'reference_summary': sample['completion'],
+                'generated_summary': summary
+            }) + '\n')
+    print(f"Saved {num_samples} summaries to {filename}")
+
+# Save evaluation summaries (adjust num_samples as needed)
+save_evaluation_summaries(eval_dataset, 'evaluation_summaries.jsonl', num_samples=100)
