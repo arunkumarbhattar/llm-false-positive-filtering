@@ -172,7 +172,6 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     prompts = []
 
     model.eval()
-    model.to(device)
 
     # Modified Generation Parameters
     generation_kwargs = {
@@ -338,15 +337,15 @@ tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention
 if os.path.exists(save_directory) and not args.retrain:
     logger.info(f"Found a saved model in {save_directory}. Loading the model and skipping training.")
 
-    # Load the model from the save_directory with quantization_config
-    model = AutoModelForCausalLM.from_pretrained(
-        save_directory,
-        cache_dir=cache_dir,
-        device_map='auto',
-        torch_dtype=torch.float16,
-        quantization_config=bnb_config,
-        trust_remote_code=False
-    )
+    # # Load the model from the save_directory with quantization_config
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     save_directory,
+    #     cache_dir=cache_dir,
+    #     device_map='auto',
+    #     torch_dtype=torch.float16,
+    #     quantization_config=bnb_config,
+    #     trust_remote_code=False
+    # )
 
 else:
     logger.info("No saved model found or retraining requested. Proceeding with training.")
@@ -483,8 +482,6 @@ else:
     tokenizer.save_pretrained(save_directory)
     print(f"Model saved to {save_directory}")
 
-else:
-logger.info("Skipping training.")
 
 # Load the base model with quantization_config
 model = AutoModelForCausalLM.from_pretrained(
@@ -558,7 +555,6 @@ save_evaluation_summaries(
 # --------------------------
 print("\nEnter 'exit' to quit the chat.")
 model.eval()
-model.to('cuda')  # Ensure model is on the correct device
 while True:
     user_input = input("User: ")
     if user_input.lower() == 'exit':
