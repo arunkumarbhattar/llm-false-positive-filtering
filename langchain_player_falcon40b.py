@@ -97,9 +97,9 @@ text_generation_pipeline = pipeline(
     # device=0 if config.device == 'cuda' else -1,  # Removed to prevent device conflict
     torch_dtype=config.torch_dtype,
     trust_remote_code=False,  # Set to False as per warning
-    max_length=2248,
-    truncation=True,  # Explicitly enable truncation
-    padding='max_length',  # Ensure consistent padding
+    max_new_tokens=200,       # Specify the number of tokens to generate
+    truncation=True,          # Explicitly enable truncation
+    padding='max_length',     # Ensure consistent padding
 )
 
 # Create LangChain LLM
