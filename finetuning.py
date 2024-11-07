@@ -227,7 +227,6 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
     """
     print("\nSample Generated Summaries:")
     model.eval()
-    model.to(device)
     for i in range(num_samples):
         sample = eval_dataset[i]
         prompt = sample['prompt']
