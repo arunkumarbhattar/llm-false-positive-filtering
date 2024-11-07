@@ -1,10 +1,18 @@
 import config
 
 from langchain_community.llms import HuggingFacePipeline  # Updated import to langchain-community
-from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.prompts.chat import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain.agents import initialize_agent, AgentType, Tool
-from langchain import LLMChain
+from langchain.agents import (
+    Tool,
+    AgentExecutor,
+    create_structured_chat_agent,
+)
+from langchain.chains import LLMChain
 from pydantic import BaseModel, Field
 import torch
 import dataset
@@ -14,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 tokenizer = AutoTokenizer.from_pretrained(
     config.model_name,
     cache_dir=config.cache_dir,
-    trust_remote_code=True
+    trust_remote_code=True,
 )
 
 # Load the model with optional quantization and custom cache directory
@@ -24,7 +32,7 @@ if config.use_quantization:
 
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True,
-            llm_int8_threshold=6.0
+            llm_int8_threshold=6.0,
         )
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -33,7 +41,7 @@ if config.use_quantization:
             device_map='auto',
             torch_dtype=config.torch_dtype,
             cache_dir=config.cache_dir,
-            trust_remote_code=True
+            trust_remote_code=True,
         )
     elif config.quantization_method == 'gptq':
         # Uncomment and adjust if using GPTQ quantization
@@ -49,7 +57,7 @@ if config.use_quantization:
         #     device_map='auto',
         #     torch_dtype=config.torch_dtype,
         #     cache_dir=config.cache_dir,
-        #     trust_remote_code=True
+        #     trust_remote_code=True,
         # )
         pass
     else:
@@ -60,15 +68,14 @@ else:
         device_map='auto',
         torch_dtype=config.torch_dtype,
         cache_dir=config.cache_dir,
-        trust_remote_code=True
+        trust_remote_code=True,
     )
 
-# Create a pipeline
+# Create a pipeline without specifying the 'device' parameter
 text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    device=0 if config.device == 'cuda' else -1,  # HuggingFace uses device indices
     torch_dtype=config.torch_dtype,
     trust_remote_code=True,
     max_length=2048,
@@ -78,79 +85,53 @@ text_generation_pipeline = pipeline(
 llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
 # Define tools
-from langchain.tools import tool
+from langchain.tools import Tool
 
-@tool
 def get_func_definition(func_name: str) -> str:
-    """Get the definition of a function.
-    Use the tool when you want to lookup the definition of a function
-    whose function body has not been provided to you,
-    AND you think the definition of this function is crucial to your decision.
-    """
+    """Get the definition of a function."""
     res = ds.get_function_definition(func_name)
     if not res or len(res) == 0:
         return f"The definition of {func_name} is unavailable."
     return res[:10000]
 
-@tool
 def variable_def_finder(filename: str, lineno: int, varname: str) -> str:
-    """
-    Finds all definitions of a local variable in a specified function within a given file.
-
-    Parameters:
-    -----------
-    filename : str
-        The name (and path, if necessary) of the source file to analyze.
-    lineno : int
-        The line number in the source file where the function containing the variable is defined.
-    varname : str
-        The name of the local variable whose definitions are to be found.
-
-    Returns:
-    --------
-    str
-        A string containing the details of the line numbers of all definitions of the specified
-        variable. If no definitions are found, the function may return an empty string or an error
-        message depending on the analysis result.
-    """
+    """Finds all definitions of a local variable in a specified function within a given file."""
     return ds.variable_def_finder(filename, lineno, varname)
 
-@tool
 def get_path_constraint(filename: str, lineno: int) -> str:
-    """
-    Retrieves the path constraint for a specific source code location.
-
-    This function analyzes the code at the given file and line number, extracting the
-    logical path constraint that leads to the specified location. Path constraints
-    are the conditions that must be true for the execution to reach the given line
-    in the code.
-
-    Parameters:
-    -----------
-    filename : str
-        The name (and path, if necessary) of the source file to analyze.
-    lineno : int
-        The line number in the source file for which the path constraint is to be determined.
-
-    Returns:
-    --------
-    str
-        A string representation of the path constraint that leads to the specified line.
-        If no constraint is found or the analysis fails, an empty string or a relevant
-        error message may be returned.
-    """
+    """Retrieves the path constraint for a specific source code location."""
     return ds.get_path_constraint(filename, lineno)
 
-# Define tools list
-tools = [get_func_definition, variable_def_finder, get_path_constraint]
+tools = [
+    Tool(
+        name="get_func_definition",
+        func=get_func_definition,
+        description="Get the definition of a function. Use when you need to find a function's code.",
+    ),
+    Tool(
+        name="variable_def_finder",
+        func=variable_def_finder,
+        description=(
+            "Finds all definitions of a local variable in a specified function within a given file. "
+            "Use when you need to find where a variable is defined."
+        ),
+    ),
+    Tool(
+        name="get_path_constraint",
+        func=get_path_constraint,
+        description=(
+            "Retrieves the path constraint for a specific source code location. "
+            "Use when you need to understand the conditions leading to a code location."
+        ),
+    ),
+]
 
-# Initialize the agent
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+# Initialize the agent using create_structured_chat_agent
+agent = create_structured_chat_agent(
+    llm=llm,
+    tools=tools,
     verbose=True,
-    max_iterations=5
+    max_iterations=5,
 )
 
 # Set up the system prompt
@@ -186,8 +167,8 @@ for srcfile, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
         "msg": msg,
         "func_code": func,
         "guidance": """
-The warning at a specific source line is false positive if the variable is always initialized along all the paths that reach that line.
-"""
+The warning at a specific source line is a false positive if the variable is always initialized along all the paths that reach that line.
+""",
     }
 
     user_input = f"""Type of bug: {prompt_dict['bug_type']}
@@ -207,7 +188,6 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     print("Agent response:")
     print(response)
     # Process the response to extract is_bug and explanation
-    # You may need to parse the response to get the desired fields
 
     # For simplicity, we'll assume the agent outputs 'True Positive' or 'False Positive' in its response
     if 'True Positive' in response or 'TP' in response:
@@ -219,13 +199,15 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
         print("Unable to determine classification. Skipping...")
         continue
 
-    explanation = response  # Or extract the explanation from the response
+    explanation = response  # Use the entire response as the explanation
 
     llm_decision = {'is_bug': is_bug, 'explanation': explanation}
 
     llm_res = "LLM.BAD" if llm_decision['is_bug'] else "LLM.GOOD"
     print(f"Ground Truth: {gt}, LLM Decision: {llm_res}")
-    print(f"Line Number: {lineno}\nMessage: {msg}\nFunction Code:\n{func}\nExplanation: {llm_decision['explanation']}\n----------------\n")
+    print(
+        f"Line Number: {lineno}\nMessage: {msg}\nFunction Code:\n{func}\nExplanation: {llm_decision['explanation']}\n----------------\n"
+    )
 
     if gt == dataset.GroundTruth.BAD and llm_decision['is_bug']:
         llm_tp += 1
