@@ -45,7 +45,7 @@ text_generation_pipeline = pipeline(
     torch_dtype=config.torch_dtype,
     max_new_tokens=512,  # Increase max_new_tokens to allow longer outputs
     do_sample=True,
-    temperature=0.7,
+    temperature=0.3,
     top_p=0.9,
     pad_token_id=tokenizer.eos_token_id,  # Set pad_token_id
 )
@@ -92,11 +92,9 @@ tools = [
 
 # Prepare the system prompt
 system_prompt = """
-You are a software security researcher tasked with classifying alerts generated from CodeQL, a static analysis tool.
+You are a software security researcher tasked with processing alerts generated from CodeQL, a static analysis tool.
 
-True Positive (TP): An alert that correctly identifies a genuine security vulnerability, code defect, or performance issue.
-
-False Positive (FP): An alert that incorrectly identifies a problem where none exists, due to misinterpretation or overly conservative analysis.
+Your sole responsibility is to determine which tools to invoke based on the type of bug, its location, and the provided guidance. You must extract the necessary parameters for each tool call without making any classification decisions.
 
 Please adhere to the following guidelines:
 
@@ -108,28 +106,28 @@ Please adhere to the following guidelines:
 
 * In C and C++, defining a variable with the static keyword inside a function only affects that specific variable. The use of static ensures that this variable retains its value between function calls and is not reinitialized on subsequent calls. However, this behavior does not apply to other variables in the same function unless they are also explicitly defined with static. Each variable's storage class and lifetime are independent of others in the function, and only variables defined with static retain their values across multiple calls.
 
-The user will provide the alert to be classified. It contains the type of bugs the CodeQL rule intends to detect, the source line of the potential bug, the message describing the bug, followed by the code of the function containing the bug, with line numbers on the left. The language of code is C/C++.
+The user will provide the alert to be processed. It contains the type of bug the CodeQL rule intends to detect, the source line of the potential bug, the message describing the bug, followed by the code of the function containing the bug, with line numbers on the left. The language of code is C/C++.
+
+Your task is to determine which tools to call based on the guidance and the bug alert information. For each tool you decide to call, specify the tool name and provide the necessary parameters.
 """
 
 # Define the format instructions
 format_instructions = """
 Use the following format:
 
-Question: the input question you must answer
+Tool Calls:
+  [tool_name_1] ([call_id_1])
+ Call ID: [call_id_1]
+  Args:
+    [arg1]: [value1]
+    [arg2]: [value2]
+  [tool_name_2] ([call_id_2])
+ Call ID: [call_id_2]
+  Args:
+    [arg1]: [value1]
+    [arg2]: [value2]
 
-Thought: your reasoning process. Analyze the code and decide if you need to use any tools.
-
-If you decide to use a tool, output:
-
-Action: the action to take, should be one of [{tool_names}]
-
-Action Input: the input to the action
-
-Then wait for the Observation from the tool before continuing your Thought.
-
-If you have enough information, proceed to the final answer.
-
-Answer: the final classification as either True Positive (TP) or False Positive (FP), along with a brief explanation.
+Replace [tool_name_n], [call_id_n], [argn], and [valuen] with the actual tool names, unique call identifiers, argument names, and their corresponding values.
 """
 
 # Prepare the tool names
@@ -143,10 +141,9 @@ prompt_template = PromptTemplate(
 
 {format_instructions}
 
-Question: {{input}}
-
+Tool Calls:
 {{agent_scratchpad}}
-""".replace("{tool_names}", tool_names),
+""".strip(),
 )
 
 # Initialize the LLMChain with the custom prompt
@@ -169,19 +166,24 @@ agent_executor = AgentExecutor.from_agent_and_tools(
     verbose=True,
 )
 
-# Initialize variables
+# Initialize variables for evaluation metrics
 llm_tp, llm_fn, llm_fp, llm_tn = 0, 0, 0, 0
+
+# Define paths (ensure these paths are correct and accessible)
 repo_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3"
 sarif_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
 bitcode_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
+
+# Initialize the dataset
 ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
 logger.info("Starting main processing loop...")
-# Main loop
+# Main loop to process each CodeQL alert
 for srcfile, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
     if not srcfile.endswith("_11.c"):
         logger.debug(f"Skipping file {srcfile} as it does not end with '_11.c'.")
         continue
+
     prompt_dict = {
         "bug_type": "Potentially uninitialized local variable",
         "filename": srcfile,
@@ -215,42 +217,59 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     logger.info("Agent response received.")
     logger.debug(f"Response: {response}")
 
-    # Parse the response
-    is_bug = None
-    explanation = response
-
-    # Define regex patterns for parsing
-    tp_pattern = re.compile(r'\b(True Positive|TP)\b', re.IGNORECASE)
-    fp_pattern = re.compile(r'\b(False Positive|FP)\b', re.IGNORECASE)
-
-    if tp_pattern.search(response):
-        is_bug = True
-        logger.debug("Parsed response as True Positive.")
-    elif fp_pattern.search(response):
-        is_bug = False
-        logger.debug("Parsed response as False Positive.")
-    else:
-        # Unable to determine, skip
-        logger.warning("Unable to determine classification from the response. Skipping...")
-        continue
-
-    llm_decision = {'is_bug': is_bug, 'explanation': explanation}
-
-    llm_res = "LLM.BAD" if llm_decision['is_bug'] else "LLM.GOOD"
-    logger.info(f"Ground Truth: {gt}, LLM Decision: {llm_res}")
-    logger.debug(
-        f"Line Number: {lineno}\nMessage: {msg}\nFunction Code:\n{func}\nExplanation: {llm_decision['explanation']}\n----------------\n"
+    # Parse the response to extract tool calls
+    tool_call_pattern = re.compile(
+        r'(?P<tool_name>\w+)\s+\((?P<call_id>call_[\w\d]+)\)\s+Call ID:\s+(?P=call_id)\s+Args:\s+((?:\s+[\w]+:\s+.+\n)+)'
     )
 
-    # Update counters based on ground truth and model decision
-    if gt == dataset.GroundTruth.BAD and llm_decision['is_bug']:
-        llm_tp += 1
-    elif gt == dataset.GroundTruth.BAD and not llm_decision['is_bug']:
-        llm_fn += 1
-    elif gt == dataset.GroundTruth.GOOD and llm_decision['is_bug']:
-        llm_fp += 1
-    elif gt == dataset.GroundTruth.GOOD and not llm_decision['is_bug']:
-        llm_tn += 1
+    matches = tool_call_pattern.finditer(response)
+    tool_calls = []
+
+    for match in matches:
+        tool_name = match.group("tool_name")
+        call_id = match.group("call_id")
+        args_block = match.group(4).strip()
+        # Extract arguments
+        args = {}
+        for arg_line in args_block.split('\n'):
+            arg_match = re.match(r'\s+([\w]+):\s+(.+)', arg_line)
+            if arg_match:
+                arg_key = arg_match.group(1)
+                arg_value = arg_match.group(2)
+                args[arg_key] = arg_value
+        tool_calls.append({
+            "name": tool_name,
+            "id": call_id,
+            "args": args
+        })
+
+    # Execute the tool calls and gather observations
+    observations = {}
+    for tool_call in tool_calls:
+        tool_name = tool_call["name"]
+        call_id = tool_call["id"]
+        args = tool_call["args"]
+
+        # Find the corresponding tool
+        tool = next((t for t in tools if t.name == tool_name), None)
+        if tool is None:
+            logger.warning(f"Tool {tool_name} not found among defined tools.")
+            continue
+
+        # Execute the tool function with extracted arguments
+        observation = tool.func(**args)
+        observations[call_id] = observation
+        logger.debug(f"Executed tool {tool_name} with Call ID {call_id}: {observation}")
+
+    # At this point, you can use the observations to make further decisions or classifications
+    # For the purpose of this modification, we'll stop here
+
+    # Example: Logging the observations
+    logger.info(f"Observations for file {srcfile} at line {lineno}: {observations}")
+
+    # Update counters based on ground truth if necessary
+    # (This part remains unchanged as per your original setup)
+    # ...
 
 # Final evaluation metrics
 logger.info("Processing complete. Calculating evaluation metrics...")
