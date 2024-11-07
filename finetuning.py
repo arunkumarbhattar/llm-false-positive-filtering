@@ -14,7 +14,9 @@ from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig, Ta
 from transformers import TrainerCallback, EarlyStoppingCallback
 import logging
 from tqdm import tqdm
-import evaluate  # Updated import
+import evaluate  # Ensure you have the `evaluate` library installed
+
+from torch.utils.data import DataLoader
 
 # --------------------------
 # Set up logging
@@ -267,38 +269,6 @@ if trainable_params == 0:
     raise ValueError("No trainable parameters found. Check if PEFT is applied correctly.")
 
 # --------------------------
-# Define evaluation metrics (ROUGE for summarization)
-# --------------------------
-rouge = evaluate.load("rouge")
-
-def compute_metrics(eval_pred):
-    """
-    Computes ROUGE metrics for summarization tasks.
-    """
-    predictions, labels = eval_pred
-    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-
-    # Replace -100 in the labels as we set them to ignore in loss computation
-    labels = [
-        [l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels
-    ]
-    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-    # Rouge expects newline after each sentence
-    decoded_preds = ["\n".join(pred.strip().split("\n")) for pred in decoded_preds]
-    decoded_labels = ["\n".join(label.strip().split("\n")) for label in decoded_labels]
-
-    result = rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-
-    # Extract the median scores
-    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-
-    # Add additional metrics if needed
-    return {k: round(v, 4) for k, v in result.items()}
-
-# --------------------------
-
-# --------------------------
 # Define training arguments based on reference code
 # --------------------------
 training_args = TrainingArguments(
@@ -306,7 +276,7 @@ training_args = TrainingArguments(
     per_device_train_batch_size=16,        # Increased batch size for better gradient estimates
     per_device_eval_batch_size=16,         # Increased eval batch size
     gradient_accumulation_steps=4,         # Adjusted to simulate larger batch size without exceeding GPU memory
-    num_train_epochs=5,                    # Increased epochs for more training time
+    num_train_epochs=120,                    # Increased epochs for more training time
     learning_rate=1e-4,                     # Lowered learning rate for finer convergence
     weight_decay=0.01,                     # As per reference code
     logging_dir='./logs',                  # Local logging dir
@@ -362,7 +332,7 @@ data_collator = DataCollatorForLanguageModeling(
 )
 
 # --------------------------
-# Initialize the Trainer with evaluation and callbacks
+# Initialize the Trainer without compute_metrics
 # --------------------------
 trainer = Trainer(
     model=model,
@@ -370,7 +340,7 @@ trainer = Trainer(
     train_dataset=tokenized_train_dataset,
     eval_dataset=tokenized_eval_dataset,
     data_collator=data_collator,
-    compute_metrics=compute_metrics,  # ROUGE metrics
+    # compute_metrics=compute_metrics,  # Removed to handle evaluation separately
     callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
 )
 
@@ -388,64 +358,150 @@ trainer.save_model(save_directory)
 print(f"Model saved to {save_directory}")
 
 # --------------------------
-# Perform Evaluation
+# Perform Evaluation with Generation and Compute ROUGE Metrics
 # --------------------------
-evaluation_results = trainer.evaluate()
-print("Evaluation Results:")
+def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=16, max_length=512, num_beams=4):
+    """
+    Generates summaries for the evaluation dataset and computes ROUGE metrics.
+    """
+    # Load ROUGE metric
+    rouge = evaluate.load("rouge")
+
+    # Create DataLoader for evaluation
+    eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size)
+
+    generated_summaries = []
+    reference_summaries = []
+
+    model = trainer.model
+    model.eval()
+    model.to(device)
+
+    generation_kwargs = {
+        "max_length": max_length,
+        "num_beams": num_beams,
+        "early_stopping": True,
+        "do_sample": False
+    }
+
+    with torch.no_grad():
+        for batch in tqdm(eval_dataloader, desc="Generating summaries"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+
+            # Generate summaries
+            outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask, **generation_kwargs)
+            decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+            # Decode references
+            labels = batch['labels']
+            # Replace -100 in labels as we set them to ignore in loss computation
+            labels = [
+                [l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels
+            ]
+            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+            # Append to lists
+            generated_summaries.extend(decoded_preds)
+            reference_summaries.extend(decoded_labels)
+
+    # Compute ROUGE scores
+    result = rouge.compute(predictions=generated_summaries, references=reference_summaries, use_stemmer=True)
+
+    # Extract the median scores and scale them
+    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+    # Round the results for readability
+    result = {k: round(v, 4) for k, v in result.items()}
+
+    return result, generated_summaries, reference_summaries
+
+# --------------------------
+# Execute Evaluation
+# --------------------------
+evaluation_results, generated_summaries, reference_summaries = evaluate_model(
+    trainer=trainer,
+    tokenizer=tokenizer,
+    eval_dataset=tokenized_eval_dataset,
+    device='cuda',            # Change to 'cpu' if GPU is not available
+    batch_size=16,
+    max_length=512,
+    num_beams=4
+)
+
+print("Evaluation Results (ROUGE scores):")
 print(evaluation_results)
 
 # --------------------------
-# Optional: Generate summaries from the evaluation set
+# Optional: Generate and Print Sample Summaries
 # --------------------------
-def generate_summary(sample):
+def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num_samples=5):
     """
-    Generates a summary for a given sample using the fine-tuned model.
+    Generates and prints sample summaries from the evaluation dataset.
     """
-    prompt = sample['prompt']
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to('cuda')
-    # Generate summary
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids,
-            max_length=512,          # Adjust based on your needs
-            num_beams=4,
-            early_stopping=True,
-            do_sample=False
-        )
-    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return summary
+    print("\nSample Generated Summaries:")
+    for i in range(num_samples):
+        sample = eval_dataset[i]
+        prompt = sample['prompt']
+        # Tokenize the prompt
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        attention_mask = tokenizer(prompt, return_tensors="pt").attention_mask.to(device)
 
-# Generate summaries for a subset of the evaluation set
-num_samples_to_generate = 5
-print("\nSample Generated Summaries:")
-for i in range(num_samples_to_generate):
-    sample = eval_dataset[i]
-    summary = generate_summary(sample)
-    print(f"\nSample {i+1}:")
-    print("Prompt:")
-    print(sample['prompt'])
-    print("Generated Summary:")
-    print(summary)
-    print("Reference Summary:")
-    print(sample['completion'])
+        # Generate summary
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=512,
+                num_beams=4,
+                early_stopping=True,
+                do_sample=False
+            )
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Reference summary
+        # Replace -100 in labels to get the actual token IDs
+        labels = sample['labels']
+        labels = [l if l != -100 else tokenizer.pad_token_id for l in labels]
+        reference_summary = tokenizer.decode(labels, skip_special_tokens=True)
+
+        print(f"\nSample {i+1}:")
+        print("Prompt:")
+        print(prompt)
+        print("Generated Summary:")
+        print(summary)
+        print("Reference Summary:")
+        print(reference_summary)
+
+# Generate and print sample summaries
+generate_sample_summaries(
+    eval_dataset=tokenized_eval_dataset,
+    tokenizer=tokenizer,
+    model=trainer.model,
+    device='cuda',    # Change to 'cpu' if GPU is not available
+    num_samples=5
+)
 
 # --------------------------
 # Save evaluation summaries to a JSONL file
 # --------------------------
-def save_evaluation_summaries(dataset, filename, num_samples=100):
+def save_evaluation_summaries(generated_summaries, reference_summaries, filename, num_samples=100):
     """
-    Generates and saves summaries for a specified number of samples from the dataset.
+    Saves generated and reference summaries to a JSONL file.
     """
     with open(filename, 'w') as f:
-        for i in tqdm(range(num_samples), desc=f"Saving summaries to {filename}"):
-            sample = dataset[i]
-            summary = generate_summary(sample)
+        for i in tqdm(range(min(num_samples, len(generated_summaries))), desc=f"Saving summaries to {filename}"):
             f.write(json.dumps({
-                'prompt': sample['prompt'],
-                'reference_summary': sample['completion'],
-                'generated_summary': summary
+                'prompt': eval_dataset[i]['prompt'],
+                'reference_summary': reference_summaries[i],
+                'generated_summary': generated_summaries[i]
             }) + '\n')
-    print(f"Saved {num_samples} summaries to {filename}")
+    print(f"Saved {min(num_samples, len(generated_summaries))} summaries to {filename}")
 
 # Save evaluation summaries (adjust num_samples as needed)
-save_evaluation_summaries(eval_dataset, 'evaluation_summaries.jsonl', num_samples=100)
+save_evaluation_summaries(
+    generated_summaries=generated_summaries,
+    reference_summaries=reference_summaries,
+    filename='evaluation_summaries.jsonl',
+    num_samples=100
+)
