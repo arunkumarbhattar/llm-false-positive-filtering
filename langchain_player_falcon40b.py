@@ -2,8 +2,6 @@ import config
 
 from langchain.llms import HuggingFacePipeline
 from langchain.prompts import PromptTemplate
-from langchain.agents import ZeroShotAgent, AgentExecutor
-from langchain import LLMChain
 import torch
 import dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
@@ -90,80 +88,49 @@ tools = [
     ),
 ]
 
-# Prepare the system prompt
-system_prompt = """
+# Define prompt templates for each step
+step1_prompt_template = PromptTemplate(
+    input_variables=["bug_info", "guidance", "tool_names"],
+    template="""
 You are a software security researcher tasked with processing alerts generated from CodeQL, a static analysis tool.
 
-Your sole responsibility is to determine which tools to invoke based on the type of bug, its location, and the provided guidance. You must extract the necessary parameters for each tool call without making any classification decisions.
+Given the following bug information:
 
-Please adhere to the following guidelines:
+{bug_info}
 
-* Concentrate only on the bug type and location specified by the user. Do NOT consider or report on other potential bugs or issues outside the provided scope.
+And the following guidance:
 
-* Do NOT assume or speculate about any future changes or modifications to the code. Your responses should strictly reflect the current state of the code as provided.
+{guidance}
 
-* Do NOT hurry to make a decision when uncertain. Use the provided tools to seek clarification or obtain necessary information.
+Your task is to determine which tools to call from the available tools: {tool_names}.
 
-* In C and C++, defining a variable with the static keyword inside a function only affects that specific variable. The use of static ensures that this variable retains its value between function calls and is not reinitialized on subsequent calls. However, this behavior does not apply to other variables in the same function unless they are also explicitly defined with static. Each variable's storage class and lifetime are independent of others in the function, and only variables defined with static retain their values across multiple calls.
+List the tools you need to call, without providing any arguments.
 
-The user will provide the alert to be processed. It contains the type of bug the CodeQL rule intends to detect, the source line of the potential bug, the message describing the bug, followed by the code of the function containing the bug, with line numbers on the left. The language of code is C/C++.
-
-Your task is to determine which tools to call based on the guidance and the bug alert information. For each tool you decide to call, specify the tool name and provide the necessary parameters.
-"""
-
-# Define the format instructions
-format_instructions = """
-Use the following format:
-
-Tool Calls:
-  [tool_name_1] ([call_id_1])
- Call ID: [call_id_1]
-  Args:
-    [arg1]: [value1]
-    [arg2]: [value2]
-  [tool_name_2] ([call_id_2])
- Call ID: [call_id_2]
-  Args:
-    [arg1]: [value1]
-    [arg2]: [value2]
-
-Replace [tool_name_n], [call_id_n], [argn], and [valuen] with the actual tool names, unique call identifiers, argument names, and their corresponding values.
-"""
-
-# Prepare the tool names
-tool_names = ", ".join([tool.name for tool in tools])
-
-# Create the prompt template
-prompt_template = PromptTemplate(
-    input_variables=["input", "agent_scratchpad"],
-    template=f"""
-{system_prompt}
-
-{format_instructions}
-
-Tool Calls:
-{{agent_scratchpad}}
+Provide your answer as a comma-separated list of tool names.
 """.strip(),
 )
 
-# Initialize the LLMChain with the custom prompt
-llm_chain = LLMChain(llm=llm, prompt=prompt_template)
+step2_prompt_template = PromptTemplate(
+    input_variables=["tool_name", "bug_info", "guidance"],
+    template="""
+You have decided to call the tool "{tool_name}" based on the following bug information:
 
-# Create the ZeroShotAgent
-agent = ZeroShotAgent.from_llm_and_tools(
-    llm=llm,
-    tools=tools,
-    prefix=system_prompt,
-    format_instructions=format_instructions.replace("{tool_names}", tool_names),
-    max_iterations=5,
-    verbose=True,
-)
+{bug_info}
 
-# Create the AgentExecutor
-agent_executor = AgentExecutor.from_agent_and_tools(
-    agent=agent,
-    tools=tools,
-    verbose=True,
+And the following guidance:
+
+{guidance}
+
+Now, extract the necessary arguments for the tool "{tool_name}".
+
+Provide the arguments in the following format:
+
+Args:
+  arg1: value1
+  arg2: value2
+
+Replace arg1, arg2, etc., and value1, value2, etc., with the actual argument names and their corresponding values.
+""".strip(),
 )
 
 # Initialize variables for evaluation metrics
@@ -195,76 +162,107 @@ The warning at a specific source line is a false positive if the variable is alw
 """,
     }
 
-    user_input = f"""Type of bug: {prompt_dict['bug_type']}
+    bug_info = f"""Type of bug: {prompt_dict['bug_type']}
 Source file name: {prompt_dict['filename']}
 Line number: {prompt_dict['lineno']}
 Message: {prompt_dict['msg']}
 Function code:
 {prompt_dict['func_code']}
-
-Guidance on triaging this type of bug: {prompt_dict['guidance']}
 """
 
-    final_input = user_input
+    guidance = prompt_dict['guidance']
 
-    logger.info(f"Running agent for file {srcfile} at line {lineno}...")
+    tool_names = ", ".join([tool.name for tool in tools])
+
+    # Step 1: Decide which tools to call
+    step1_llm_chain = LLMChain(llm=llm, prompt=step1_prompt_template)
+
+    step1_input = {
+        "bug_info": bug_info,
+        "guidance": guidance,
+        "tool_names": tool_names,
+    }
+
+    logger.info(f"Running step 1 LLM chain for file {srcfile} at line {lineno}...")
     try:
-        response = agent_executor.run(final_input)
+        step1_response = step1_llm_chain.run(step1_input)
     except Exception as e:
-        logger.error(f"Error running the agent: {e}")
+        logger.error(f"Error running the step 1 LLM chain: {e}")
         continue
 
-    logger.info("Agent response received.")
-    logger.debug(f"Response: {response}")
+    logger.info("Step 1 LLM response received.")
+    logger.debug(f"Step 1 Response: {step1_response}")
 
-    # Parse the response to extract tool calls
-    tool_call_pattern = re.compile(
-        r'(?P<tool_name>\w+)\s+\((?P<call_id>call_[\w\d]+)\)\s+Call ID:\s+(?P=call_id)\s+Args:\s+((?:\s+[\w]+:\s+.+\n)+)'
-    )
+    # Parse the response to get the list of tools
+    # Assuming the response is a comma-separated list of tool names
+    tool_list = [tool_name.strip() for tool_name in step1_response.split(",")]
 
-    matches = tool_call_pattern.finditer(response)
-    tool_calls = []
+    # Remove any empty strings
+    tool_list = [tool_name for tool_name in tool_list if tool_name]
 
-    for match in matches:
-        tool_name = match.group("tool_name")
-        call_id = match.group("call_id")
-        args_block = match.group(4).strip()
-        # Extract arguments
-        args = {}
-        for arg_line in args_block.split('\n'):
-            arg_match = re.match(r'\s+([\w]+):\s+(.+)', arg_line)
-            if arg_match:
-                arg_key = arg_match.group(1)
-                arg_value = arg_match.group(2)
-                args[arg_key] = arg_value
-        tool_calls.append({
-            "name": tool_name,
-            "id": call_id,
-            "args": args
-        })
-
-    # Execute the tool calls and gather observations
+    # For each tool, get the arguments
     observations = {}
-    for tool_call in tool_calls:
-        tool_name = tool_call["name"]
-        call_id = tool_call["id"]
-        args = tool_call["args"]
-
-        # Find the corresponding tool
+    for tool_name in tool_list:
+        # Ensure the tool name is valid
         tool = next((t for t in tools if t.name == tool_name), None)
         if tool is None:
             logger.warning(f"Tool {tool_name} not found among defined tools.")
             continue
 
-        # Execute the tool function with extracted arguments
-        observation = tool.func(**args)
-        observations[call_id] = observation
-        logger.debug(f"Executed tool {tool_name} with Call ID {call_id}: {observation}")
+        # Step 2: Get the arguments for the tool
+        step2_llm_chain = LLMChain(llm=llm, prompt=step2_prompt_template)
 
-    # At this point, you can use the observations to make further decisions or classifications
-    # For the purpose of this modification, we'll stop here
+        step2_input = {
+            "tool_name": tool_name,
+            "bug_info": bug_info,
+            "guidance": guidance,
+        }
 
-    # Example: Logging the observations
+        logger.info(f"Running step 2 LLM chain for tool {tool_name}...")
+        try:
+            step2_response = step2_llm_chain.run(step2_input)
+        except Exception as e:
+            logger.error(f"Error running the step 2 LLM chain for tool {tool_name}: {e}")
+            continue
+
+        logger.info(f"Step 2 LLM response received for tool {tool_name}.")
+        logger.debug(f"Step 2 Response for tool {tool_name}: {step2_response}")
+
+        # Parse the arguments from the response
+        # Assuming the response is in the format:
+        # Args:
+        #   arg1: value1
+        #   arg2: value2
+
+        args_pattern = re.compile(r'Args:\s*((?:\s+\w+:\s+.*\n?)+)', re.MULTILINE)
+        args_match = args_pattern.search(step2_response)
+
+        if not args_match:
+            logger.error(f"Could not parse arguments for tool {tool_name} from response.")
+            continue
+
+        args_block = args_match.group(1)
+        args = {}
+        for arg_line in args_block.strip().split('\n'):
+            arg_match = re.match(r'\s*(\w+):\s+(.*)', arg_line)
+            if arg_match:
+                arg_key = arg_match.group(1)
+                arg_value = arg_match.group(2)
+                args[arg_key] = arg_value
+            else:
+                logger.warning(f"Could not parse argument line: {arg_line}")
+
+        # Now execute the tool function
+        logger.info(f"Executing tool {tool_name} with arguments: {args}")
+        try:
+            observation = tool.func(**args)
+            observations[tool_name] = observation
+            logger.debug(f"Executed tool {tool_name}: {observation}")
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {e}")
+
+    # Now, we can proceed with further processing using the observations
+    # For the purpose of this code, we'll log the observations
     logger.info(f"Observations for file {srcfile} at line {lineno}: {observations}")
 
     # Update counters based on ground truth if necessary
@@ -273,6 +271,6 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
 
 # Final evaluation metrics
 logger.info("Processing complete. Calculating evaluation metrics...")
-print(f"LLM Precision: {llm_tp}/{llm_tp + llm_fp}")
-print(f"LLM Recall: {llm_tp}/{llm_tp + llm_fn}")
+print(f"LLM Precision: {llm_tp}/{llm_tp + llm_fp if llm_tp + llm_fp > 0 else 1}")
+print(f"LLM Recall: {llm_tp}/{llm_tp + llm_fn if llm_tp + llm_fn > 0 else 1}")
 print(f"TP/FP/FN/TN: {llm_tp}/{llm_fp}/{llm_fn}/{llm_tn}")
