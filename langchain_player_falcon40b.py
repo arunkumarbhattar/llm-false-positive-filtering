@@ -1,6 +1,6 @@
 import config
 
-from langchain_community.llms import HuggingFacePipeline  # Updated import to langchain-community
+from langchain_huggingface import HuggingFacePipeline  # Updated import to langchain-huggingface
 from langchain.prompts.chat import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
@@ -76,6 +76,7 @@ text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
+    # device=0 if config.device == 'cuda' else -1,  # Removed to prevent device conflict
     torch_dtype=config.torch_dtype,
     trust_remote_code=True,
     max_length=2048,
@@ -130,7 +131,6 @@ tools = [
 agent = create_structured_chat_agent(
     llm=llm,
     tools=tools,
-    verbose=True,
     max_iterations=5,
 )
 
