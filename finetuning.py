@@ -7,11 +7,17 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    DataCollatorForLanguageModeling
 )
 from datasets import Dataset
-from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig, TaskType
+from peft import (
+    prepare_model_for_kbit_training,
+    get_peft_model,
+    LoraConfig,
+    TaskType,
+    PeftModel
+)
 from transformers import TrainerCallback, EarlyStoppingCallback
 import logging
 from tqdm import tqdm
@@ -109,7 +115,8 @@ def print_trainable_parameters(model):
         if param.requires_grad:
             trainable_params += param.numel()
     print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}%"
+        f"trainable params: {trainable_params} || all params: {all_param} || "
+        f"trainable%: {100 * trainable_params / all_param:.2f}%"
     )
 
 # --------------------------
@@ -154,6 +161,9 @@ def preprocess_function(examples, tokenizer):
 
     # Prepare the final tokenized inputs
     tokenized_full_texts['labels'] = labels
+    # Keep the prompts and completions
+    tokenized_full_texts['prompt'] = inputs
+    tokenized_full_texts['completion'] = outputs
 
     return tokenized_full_texts
 
@@ -162,7 +172,7 @@ def preprocess_function(examples, tokenizer):
 # --------------------------
 def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=128, num_beams=1):
     """
-    Generates summaries for the evaluation dataset and computes ROUGE metrics.
+    Generates completions for the evaluation dataset and computes ROUGE metrics.
     Also shows ground truth and generated outputs.
     """
     # Load ROUGE metric
@@ -171,13 +181,12 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # Create DataLoader for evaluation
     eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size)
 
-    generated_summaries = []
-    reference_summaries = []
+    generated_completions = []
+    reference_completions = []
     prompts = []
 
     model.eval()
     # Note: model.device_map='auto' already handles device placement
-    # Do not move the model manually
 
     # Modified Generation Parameters
     generation_kwargs = {
@@ -189,31 +198,34 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     }
 
     with torch.no_grad():
-        for batch in tqdm(eval_dataloader, desc="Generating summaries"):
-            input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
+        for batch in tqdm(eval_dataloader, desc="Generating completions"):
+            prompts_batch = batch['prompt']
+            input_ids_list = []
+            attention_mask_list = []
+            for prompt in prompts_batch:
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512, padding='max_length')
+                input_ids_list.append(inputs['input_ids'][0])
+                attention_mask_list.append(inputs['attention_mask'][0])
 
-            # Generate summaries
+            input_ids = torch.stack(input_ids_list).to(model.device)
+            attention_mask = torch.stack(attention_mask_list).to(model.device)
+
+            # Generate completions
             outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask, **generation_kwargs)
-            decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            # Exclude the prompt tokens from the outputs
+            generated_tokens = outputs[:, input_ids.shape[1]:]
+            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
-            # Decode references
-            labels = batch['labels']
-            # Replace -100 in labels as we set them to ignore in loss computation
-            labels = [
-                [l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels
-            ]
-            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            # Get reference completions
+            references = batch['completion']
 
             # Append to lists
-            generated_summaries.extend(decoded_preds)
-            reference_summaries.extend(decoded_labels)
-            # Also collect prompts
-            batch_prompts = tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
-            prompts.extend(batch_prompts)
+            generated_completions.extend(decoded_preds)
+            reference_completions.extend(references)
+            prompts.extend(prompts_batch)
 
     # Compute ROUGE scores
-    result = rouge.compute(predictions=generated_summaries, references=reference_summaries, use_stemmer=True)
+    result = rouge.compute(predictions=generated_completions, references=reference_completions, use_stemmer=True)
 
     # Scale the scores
     result = {key: value * 100 for key, value in result.items()}
@@ -221,7 +233,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # Round the results for readability
     result = {k: round(v, 4) for k, v in result.items()}
 
-    return result, generated_summaries, reference_summaries, prompts
+    return result, generated_completions, reference_completions, prompts
 
 # --------------------------
 # Function to generate and print sample summaries
@@ -236,10 +248,9 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
         sample = eval_dataset[i]
         prompt = sample['prompt']
         # Tokenize the prompt
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        attention_mask = tokenizer(prompt, return_tensors="pt").attention_mask.to(device)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512, padding='max_length').to(model.device)
 
-        # Generate summary
+        # Generate completion
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=inputs['input_ids'],
@@ -250,37 +261,36 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id  # Ensure pad_token_id is set
             )
-        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Exclude the prompt tokens from the outputs
+        generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
+        completion = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
 
-        # Reference summary
-        # Replace -100 in labels to get the actual token IDs
-        labels = sample['labels']
-        labels = [l if l != -100 else tokenizer.pad_token_id for l in labels]
-        reference_summary = tokenizer.decode(labels, skip_special_tokens=True)
+        # Reference completion
+        reference_completion = sample['completion']
 
         print(f"\nSample {i+1}:")
         print("Prompt:")
         print(prompt)
-        print("Generated Summary:")
-        print(summary)
-        print("Reference Summary:")
-        print(reference_summary)
+        print("Generated Completion:")
+        print(completion)
+        print("Reference Completion:")
+        print(reference_completion)
 
 # --------------------------
 # Function to save evaluation summaries to a JSONL file
 # --------------------------
-def save_evaluation_summaries(generated_summaries, reference_summaries, prompts, filename, num_samples=100):
+def save_evaluation_summaries(generated_completions, reference_completions, prompts, filename, num_samples=100):
     """
     Saves generated and reference summaries to a JSONL file.
     """
     with open(filename, 'w') as f:
-        for i in tqdm(range(min(num_samples, len(generated_summaries))), desc=f"Saving summaries to {filename}"):
+        for i in tqdm(range(min(num_samples, len(generated_completions))), desc=f"Saving summaries to {filename}"):
             f.write(json.dumps({
                 'prompt': prompts[i],
-                'reference_summary': reference_summaries[i],
-                'generated_summary': generated_summaries[i]
+                'reference_completion': reference_completions[i],
+                'generated_completion': generated_completions[i]
             }) + '\n')
-    print(f"Saved {min(num_samples, len(generated_summaries))} summaries to {filename}")
+    print(f"Saved {min(num_samples, len(generated_completions))} summaries to {filename}")
 
 # --------------------------
 # Main Execution Flow
@@ -296,9 +306,9 @@ def main():
             exit(1)
         logger.info(f"Loading the trained model from '{save_directory}' for interactive chat.")
 
-        # Load the trained model with quantization_config
+        # Load the base model
         model = AutoModelForCausalLM.from_pretrained(
-            save_directory,
+            "tiiuae/falcon-40b-instruct",
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
@@ -306,11 +316,16 @@ def main():
             trust_remote_code=False
         )
 
-        # Load the tokenizer from the save_directory
+        # Load the LoRA adapters using PeftModel.from_pretrained
+        model = PeftModel.from_pretrained(model, save_directory)
+        model.eval()
+        model.config.use_cache = True
+
+        # Load the tokenizer from the base model
         tokenizer = AutoTokenizer.from_pretrained(
-            save_directory,
+            "tiiuae/falcon-40b-instruct",
             cache_dir=cache_dir,
-            padding_side='left'  # Ensure padding side is left
+            padding_side='left'
         )
 
         # Set the pad_token to eos_token if not already set
@@ -318,9 +333,6 @@ def main():
             tokenizer.pad_token = tokenizer.eos_token
 
         # Prepare the model for inference
-        model.eval()
-        model.config.use_cache = True  # Enable cache for inference
-
         print("\nEnter 'exit' to quit the chat.")
         while True:
             user_input = input("User: ")
@@ -330,7 +342,7 @@ def main():
                 print("Please enter a valid prompt or type 'exit' to quit.")
                 continue
             # Tokenize the user input
-            inputs = tokenizer(user_input, return_tensors="pt").to(model.device)
+            inputs = tokenizer(user_input, return_tensors="pt", truncation=True, max_length=512, padding='max_length').to(model.device)
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids=inputs['input_ids'],
@@ -341,23 +353,11 @@ def main():
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id  # Ensure pad_token_id is set
                 )
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Exclude the prompt tokens from the outputs
+            generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
+            response = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
             print(f"Model: {response}")
         exit(0)  # Exit the script after the chat session
-
-    # --------------------------
-    # Load the tokenizer
-    # --------------------------
-    model_id = 'tiiuae/falcon-40b-instruct'
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        cache_dir=cache_dir,
-        padding_side='left'  # Ensure padding side is left
-    )
-
-    # Set the pad_token to eos_token if not already set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     # --------------------------
     # Load your training data
@@ -379,18 +379,32 @@ def main():
     dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
 
     # --------------------------
+    # Load the tokenizer
+    # --------------------------
+    model_id = 'tiiuae/falcon-40b-instruct'
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        cache_dir=cache_dir,
+        padding_side='left'  # Ensure padding side is left
+    )
+
+    # Set the pad_token to eos_token if not already set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # --------------------------
     # Apply the preprocessing
     # --------------------------
     tokenized_train_dataset = train_dataset.map(
         lambda examples: preprocess_function(examples, tokenizer),
         batched=True,
-        remove_columns=['prompt', 'completion']
+        # Do not remove 'prompt' and 'completion' columns
     )
 
     tokenized_eval_dataset = eval_dataset.map(
         lambda examples: preprocess_function(examples, tokenizer),
         batched=True,
-        remove_columns=['prompt', 'completion']
+        # Do not remove 'prompt' and 'completion' columns
     )
 
     # --------------------------
@@ -405,19 +419,24 @@ def main():
     if os.path.exists(save_directory) and not args.retrain:
         logger.info(f"Found a saved model in '{save_directory}'. Loading the model and skipping training.")
 
-        # Load the model from the save_directory with quantization_config
+        # Load the base model
         model = AutoModelForCausalLM.from_pretrained(
-            save_directory,
+            model_id,
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            quantization_config=bnb_config,  # Ensure bitsandbytes >=0.43.2 is installed
+            quantization_config=bnb_config,
             trust_remote_code=False
         )
 
-        # Load the tokenizer from the save_directory
+        # Load the LoRA adapters using PeftModel.from_pretrained
+        model = PeftModel.from_pretrained(model, save_directory)
+        model.eval()
+        model.config.use_cache = True
+
+        # Load the tokenizer from the base model
         tokenizer = AutoTokenizer.from_pretrained(
-            save_directory,
+            model_id,
             cache_dir=cache_dir,
             padding_side='left'
         )
@@ -425,13 +444,6 @@ def main():
         # Set the pad_token to eos_token if not already set
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-
-        # Prepare the model for inference
-        model.eval()
-        model.config.use_cache = False  # Disable cache if not needed
-
-        # Initialize Trainer for possible further evaluation or tasks
-        # (Optional: Add evaluation code here if desired)
 
     else:
         logger.info("No saved model found or retraining requested. Proceeding with training.")
@@ -561,12 +573,13 @@ def main():
         trainer.train()
 
         # --------------------------
-        # Save the final model to the save_directory
+        # Save the LoRA adapters
         # --------------------------
         os.makedirs(save_directory, exist_ok=True)
-        trainer.save_model(save_directory)
-        tokenizer.save_pretrained(save_directory)
-        print(f"Model and tokenizer saved to '{save_directory}'")
+        model.save_pretrained(save_directory)
+        # Optionally save the tokenizer (but not necessary if it hasn't changed)
+        # tokenizer.save_pretrained(save_directory)
+        print(f"Model saved to '{save_directory}'")
 
     # --------------------------
     # Proceed with Evaluation (Only if Not in Interactive Mode)
@@ -575,7 +588,7 @@ def main():
         logger.info("Starting evaluation...")
 
         # Perform Evaluation with Generation and Compute ROUGE Metrics
-        evaluation_results, generated_summaries, reference_summaries, prompts = evaluate_model(
+        evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,
             eval_dataset=tokenized_eval_dataset,
@@ -589,20 +602,20 @@ def main():
         print(evaluation_results)
 
         # Show ground truth and generated outputs
-        print("\nGround Truth vs Generated Summaries:")
+        print("\nGround Truth vs Generated Completions:")
         num_samples_to_show = 5
         for i in range(num_samples_to_show):
             print(f"\nSample {i+1}:")
             print("Prompt:")
             print(prompts[i])
-            print("Ground Truth:")
-            print(reference_summaries[i])
-            print("Generated Summary:")
-            print(generated_summaries[i])
+            print("Ground Truth Completion:")
+            print(reference_completions[i])
+            print("Generated Completion:")
+            print(generated_completions[i])
 
         # Optional: Generate and Print Sample Summaries
         generate_sample_summaries(
-            eval_dataset=tokenized_eval_dataset,
+            eval_dataset=eval_dataset,  # Use the original eval_dataset
             tokenizer=tokenizer,
             model=model,
             device='cuda',    # Change to 'cpu' if GPU is not available
@@ -611,16 +624,12 @@ def main():
 
         # Save evaluation summaries to a JSONL file
         save_evaluation_summaries(
-            generated_summaries=generated_summaries,
-            reference_summaries=reference_summaries,
+            generated_completions=generated_completions,
+            reference_completions=reference_completions,
             prompts=prompts,
             filename='evaluation_summaries.jsonl',
             num_samples=100
         )
-
-    # --------------------------
-    # Interactive Chat Mode is handled above
-    # --------------------------
 
 if __name__ == "__main__":
     main()
