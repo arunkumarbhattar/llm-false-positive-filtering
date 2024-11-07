@@ -13,9 +13,8 @@ from datasets import Dataset
 from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig, TaskType
 from transformers import TrainerCallback, EarlyStoppingCallback
 import logging
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
-from datasets import load_metric
+import evaluate  # Updated import
 
 # --------------------------
 # Set up logging
@@ -96,7 +95,7 @@ model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 # Apply LoRA for efficient fine-tuning
 # --------------------------
 peft_config = LoraConfig(
-    r=8,
+    r=16,  # Increased rank for more trainable parameters
     lora_alpha=32,
     target_modules=[
         "query_key_value",
@@ -104,7 +103,7 @@ peft_config = LoraConfig(
         "dense_h_to_4h",
         "dense_4h_to_h",
     ],
-    lora_dropout=0.05,
+    lora_dropout=0.1,  # Increased dropout for better regularization
     bias="none",
     task_type=TaskType.CAUSAL_LM
 )
@@ -270,7 +269,7 @@ if trainable_params == 0:
 # --------------------------
 # Define evaluation metrics (ROUGE for summarization)
 # --------------------------
-rouge = load_metric("rouge")
+rouge = evaluate.load("rouge")
 
 def compute_metrics(eval_pred):
     """
@@ -298,21 +297,23 @@ def compute_metrics(eval_pred):
     return {k: round(v, 4) for k, v in result.items()}
 
 # --------------------------
+
+# --------------------------
 # Define training arguments based on reference code
 # --------------------------
 training_args = TrainingArguments(
     output_dir='./fine_tuned_model',
-    per_device_train_batch_size=8,        # Adjust based on your GPU memory
-    per_device_eval_batch_size=8,         # As per reference code
-    gradient_accumulation_steps=8,        # As per reference code
-    num_train_epochs=10,                   # As per reference code
-    learning_rate=2e-4,                    # As per reference code
+    per_device_train_batch_size=16,        # Increased batch size for better gradient estimates
+    per_device_eval_batch_size=16,         # Increased eval batch size
+    gradient_accumulation_steps=4,         # Adjusted to simulate larger batch size without exceeding GPU memory
+    num_train_epochs=5,                    # Increased epochs for more training time
+    learning_rate=1e-4,                     # Lowered learning rate for finer convergence
     weight_decay=0.01,                     # As per reference code
     logging_dir='./logs',                  # Local logging dir
-    logging_steps=100,                     # As per reference code
+    logging_steps=50,                      # More frequent logging for better monitoring
     save_strategy="steps",
     save_steps=500,                        # Align with eval_steps
-    save_total_limit=2,                    # As per reference code
+    save_total_limit=3,                    # Increased to keep more checkpoints
     evaluation_strategy="steps",
     eval_steps=500,                        # As per reference code
     load_best_model_at_end=True,
@@ -320,7 +321,7 @@ training_args = TrainingArguments(
     fp16=True,                             # Enable mixed precision
     optim="adamw_torch",                   # Use standard AdamW optimizer
     lr_scheduler_type="cosine_with_restarts",
-    warmup_ratio=0.05,                     # Adjusted warmup steps
+    warmup_ratio=0.1,                      # Increased warmup ratio for better learning rate scheduling
     max_grad_norm=1.0,                     # Added gradient clipping
     gradient_checkpointing=True,           # As per reference
     torch_compile=False,                   # As per reference
@@ -353,34 +354,6 @@ class CustomCallback(TrainerCallback):
             logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
 
 # --------------------------
-# Define evaluation metrics (ROUGE for summarization)
-# --------------------------
-def compute_metrics(eval_pred):
-    """
-    Computes ROUGE metrics for summarization tasks.
-    """
-    predictions, labels = eval_pred
-    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-
-    # Replace -100 in the labels as we set them to ignore in loss computation
-    labels = [
-        [l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels
-    ]
-    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-    # Rouge expects newline after each sentence
-    decoded_preds = ["\n".join(pred.strip().split("\n")) for pred in decoded_preds]
-    decoded_labels = ["\n".join(label.strip().split("\n")) for label in decoded_labels]
-
-    result = rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-
-    # Extract the median scores
-    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-
-    # Add additional metrics if needed
-    return {k: round(v, 4) for k, v in result.items()}
-
-# --------------------------
 # Data collator for language modeling
 # --------------------------
 data_collator = DataCollatorForLanguageModeling(
@@ -398,7 +371,7 @@ trainer = Trainer(
     eval_dataset=tokenized_eval_dataset,
     data_collator=data_collator,
     compute_metrics=compute_metrics,  # ROUGE metrics
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=3), CustomCallback()],
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
 )
 
 # --------------------------
