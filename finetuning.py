@@ -61,6 +61,9 @@ tokenizer = AutoTokenizer.from_pretrained(
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+# **Set padding_side to 'left' to align with decoder-only architecture**
+tokenizer.padding_side = 'left'
+
 # --------------------------
 # Load the model with quantization_config and without trust_remote_code
 # --------------------------
@@ -377,8 +380,9 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
     model.eval()
     model.to(device)
 
+    # **Modified Generation Parameters**
     generation_kwargs = {
-        "max_length": max_length,
+        "max_new_tokens": 512,  # Specify the number of new tokens to generate
         "num_beams": num_beams,
         "early_stopping": True,
         "do_sample": False
@@ -415,6 +419,7 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
     result = {k: round(v, 4) for k, v in result.items()}
 
     return result, generated_summaries, reference_summaries
+
 
 # --------------------------
 # Execute Evaluation
