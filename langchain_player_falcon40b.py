@@ -1,30 +1,20 @@
 import config
 
-from langchain.llms import HuggingFacePipeline  # Updated import to langchain.llms
-from langchain.prompts.chat import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain.agents import (
-    Tool,
-    AgentExecutor,
-    AgentType,
-    initialize_agent,  # We'll use initialize_agent with the correct AgentType
-)
-from langchain.chains import LLMChain
-from pydantic import BaseModel, Field
+from langchain.llms import HuggingFacePipeline
+from langchain.prompts import PromptTemplate
+from langchain.agents import ZeroShotAgent, AgentExecutor
+from langchain import LLMChain
 import torch
 import dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 import logging
 import re
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG for detailed logs
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler()
@@ -37,7 +27,6 @@ logger.info("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
     config.model_name,
     cache_dir=config.cache_dir,
-    # trust_remote_code=True,  # Removed to avoid legacy code
 )
 tokenizer.pad_token = tokenizer.eos_token  # Set pad_token if not set
 
@@ -55,37 +44,20 @@ if config.use_quantization:
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             quantization_config=quantization_config,
-            device_map='cuda',  # Explicitly set to 'cuda'
+            device_map='cuda',
             torch_dtype=config.torch_dtype,
             cache_dir=config.cache_dir,
-            # trust_remote_code=True,  # Removed to use updated Transformers
         )
     elif config.quantization_method == 'gptq':
-        # Uncomment and adjust if using GPTQ quantization
-        # from some_gptq_library import GPTQConfig  # Replace with actual import
-
-        # gptq_config = GPTQConfig(
-        #     ...  # Add GPTQ-specific configurations
-        # )
-
-        # model = AutoModelForCausalLM.from_pretrained(
-        #     config.model_name,
-        #     quantization_config=gptq_config,
-        #     device_map='cuda',
-        #     torch_dtype=config.torch_dtype,
-        #     cache_dir=config.cache_dir,
-        #     # trust_remote_code=True,  # Removed to use updated Transformers
-        # )
         pass
     else:
         raise ValueError(f"Unknown quantization method: {config.quantization_method}")
 else:
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        device_map='cuda',  # Explicitly set to 'cuda'
+        device_map='cuda',
         torch_dtype=config.torch_dtype,
         cache_dir=config.cache_dir,
-        # trust_remote_code=True,  # Removed to use updated Transformers
     )
 
 # Create a pipeline without specifying the 'device' parameter
@@ -94,12 +66,11 @@ text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    # device=0 if config.device == 'cuda' else -1,  # Removed to prevent device conflict
     torch_dtype=config.torch_dtype,
-    trust_remote_code=False,  # Set to False as per warning
-    max_new_tokens=200,       # Specify the number of tokens to generate
-    truncation=True,          # Explicitly enable truncation
-    padding='max_length',     # Ensure consistent padding
+    trust_remote_code=False,
+    max_new_tokens=200,
+    truncation=True,
+    padding='max_length',
 )
 
 # Create LangChain LLM
@@ -107,10 +78,9 @@ logger.info("Creating LangChain LLM...")
 llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
 # Define tools
-from langchain.tools import Tool
+from langchain.tools import StructuredTool
 
 def get_func_definition(func_name: str) -> str:
-    """Get the definition of a function."""
     logger.debug(f"Fetching function definition for: {func_name}")
     res = ds.get_function_definition(func_name)
     if not res or len(res) == 0:
@@ -118,74 +88,118 @@ def get_func_definition(func_name: str) -> str:
     return res[:10000]
 
 def variable_def_finder(filename: str, lineno: int, varname: str) -> str:
-    """Finds all definitions of a local variable in a specified function within a given file."""
     logger.debug(f"Finding definitions for variable '{varname}' in {filename} at line {lineno}")
     return ds.variable_def_finder(filename, lineno, varname)
 
 def get_path_constraint(filename: str, lineno: int) -> str:
-    """Retrieves the path constraint for a specific source code location."""
     logger.debug(f"Retrieving path constraint for {filename} at line {lineno}")
     return ds.get_path_constraint(filename, lineno)
 
-tools = [
-    Tool(
-        name="get_func_definition",
-        func=get_func_definition,
-        description="Get the definition of a function. Use when you need to find a function's code.",
-    ),
-    Tool(
-        name="variable_def_finder",
-        func=variable_def_finder,
-        description=(
-            "Finds all definitions of a local variable in a specified function within a given file. "
-            "Use when you need to find where a variable is defined."
-        ),
-    ),
-    Tool(
-        name="get_path_constraint",
-        func=get_path_constraint,
-        description=(
-            "Retrieves the path constraint for a specific source code location. "
-            "Use when you need to understand the conditions leading to a code location."
-        ),
-    ),
-]
+# Define tools using StructuredTool
+get_func_definition_tool = StructuredTool.from_function(
+    func=get_func_definition,
+    name="get_func_definition",
+    description="Get the definition of a function. Use when you need to find a function's code.",
+)
 
-# Initialize the agent using initialize_agent with AgentType.ZERO_SHOT_REACT_DESCRIPTION
-logger.info("Initializing the agent...")
-try:
-    agent = initialize_agent(
-        tools,
-        llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-        verbose=True,
-        max_iterations=5  # Note: If this causes errors, consider removing or updating LangChain
-    )
-except TypeError as e:
-    logger.error(f"Error initializing the agent: {e}")
-    logger.info("Attempting to initialize agent without 'max_iterations'...")
-    agent = initialize_agent(
-        tools,
-        llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-        verbose=True,
-        # max_iterations=5  # Removed to avoid TypeError
-    )
+variable_def_finder_tool = StructuredTool.from_function(
+    func=variable_def_finder,
+    name="variable_def_finder",
+    description=(
+        "Finds all definitions of a local variable in a specified function within a given file. "
+        "Use when you need to find where a variable is defined."
+    ),
+)
 
-# Set up the system prompt
+get_path_constraint_tool = StructuredTool.from_function(
+    func=get_path_constraint,
+    name="get_path_constraint",
+    description=(
+        "Retrieves the path constraint for a specific source code location. "
+        "Use when you need to understand the conditions leading to a code location."
+    ),
+)
+
+tools = [get_func_definition_tool, variable_def_finder_tool, get_path_constraint_tool]
+
+# Prepare the system prompt
 system_prompt = """
-You are a software security researcher tasked with classifying alerts generated from CodeQL, a static analysis tool. Each alert is to be classified as either a true positive (TP) or a false positive (FP).
+You are a software security researcher tasked with classifying alerts generated from CodeQL, a static analysis tool.
+
 True Positive (TP): An alert that correctly identifies a genuine security vulnerability, code defect, or performance issue.
+
 False Positive (FP): An alert that incorrectly identifies a problem where none exists, due to misinterpretation or overly conservative analysis.
 
-The user will provide the alert to be classified. It contains the type of bugs the CodeQL rule intends to detect, the source line of the potential bug, the message describing the bug, followed by the code of the function containing the bug, with line numbers on the left. The language of code is C/C++.
-
 Please adhere to the following guidelines:
+
 * Concentrate only on the bug type and location specified by the user. Do NOT consider or report on other potential bugs or issues outside the provided scope.
+
 * Do NOT assume or speculate about any future changes or modifications to the code. Your responses should strictly reflect the current state of the code as provided.
+
 * Do NOT hurry to make a decision when uncertain. Use the provided tools to seek clarification or obtain necessary information.
+
 * In C and C++, defining a variable with the static keyword inside a function only affects that specific variable. The use of static ensures that this variable retains its value between function calls and is not reinitialized on subsequent calls. However, this behavior does not apply to other variables in the same function unless they are also explicitly defined with static. Each variable's storage class and lifetime are independent of others in the function, and only variables defined with static retain their values across multiple calls.
+
+The user will provide the alert to be classified. It contains the type of bugs the CodeQL rule intends to detect, the source line of the potential bug, the message describing the bug, followed by the code of the function containing the bug, with line numbers on the left. The language of code is C/C++.
 """
+
+# Define the format instructions
+format_instructions = """
+Use the following format:
+
+Question: the input question you must answer
+
+Thought: your reasoning process
+
+Action: the action to take, should be one of [{tool_names}]
+
+Action Input: the input to the action
+
+Observation: the result of the action
+
+... (this Thought/Action/Action Input/Observation can repeat N times)
+
+Thought: I now have enough information
+
+Answer: the final answer to the original question
+
+Remember to use the tools when necessary to find additional information.
+"""
+
+# Prepare the tool names
+tool_names = ", ".join([tool.name for tool in tools])
+
+# Create the prompt template
+prompt_template = PromptTemplate(
+    input_variables=["input", "agent_scratchpad"],
+    template=f"""
+{system_prompt}
+
+{format_instructions}
+
+Question: {{input}}
+
+{{agent_scratchpad}}
+""".replace("{tool_names}", tool_names),
+)
+
+# Initialize the LLMChain with the custom prompt
+llm_chain = LLMChain(llm=llm, prompt=prompt_template)
+
+# Create the ZeroShotAgent
+agent = ZeroShotAgent(
+    llm_chain=llm_chain,
+    tools=tools,
+    verbose=True,
+)
+
+# Create the AgentExecutor
+agent_executor = AgentExecutor.from_agent_and_tools(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    max_iterations=5,
+)
 
 # Initialize variables
 llm_tp, llm_fn, llm_fp, llm_tn = 0, 0, 0, 0
@@ -221,12 +235,11 @@ Function code:
 Guidance on triaging this type of bug: {prompt_dict['guidance']}
 """
 
-    final_input = f"{system_prompt}\n\n{user_input}"
+    final_input = user_input  # Do not include the system prompt here
 
     logger.info(f"Running agent for file {srcfile} at line {lineno}...")
     try:
-        # Run the agent using invoke instead of run due to deprecation
-        response = agent.invoke(final_input)
+        response = agent_executor.run(final_input)
     except Exception as e:
         logger.error(f"Error running the agent: {e}")
         continue
@@ -234,11 +247,14 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
     logger.info("Agent response received.")
     logger.debug(f"Response: {response}")
 
-    # Define regex patterns for parsing
-    tp_pattern = re.compile(r'\bTrue Positive\b|\bTP\b', re.IGNORECASE)
-    fp_pattern = re.compile(r'\bFalse Positive\b|\bFP\b', re.IGNORECASE)
-
     # Parse the response
+    is_bug = None
+    explanation = response
+
+    # Define regex patterns for parsing
+    tp_pattern = re.compile(r'\b(True Positive|TP)\b', re.IGNORECASE)
+    fp_pattern = re.compile(r'\b(False Positive|FP)\b', re.IGNORECASE)
+
     if tp_pattern.search(response):
         is_bug = True
         logger.debug("Parsed response as True Positive.")
@@ -249,8 +265,6 @@ Guidance on triaging this type of bug: {prompt_dict['guidance']}
         # Unable to determine, skip
         logger.warning("Unable to determine classification from the response. Skipping...")
         continue
-
-    explanation = response  # Use the entire response as the explanation
 
     llm_decision = {'is_bug': is_bug, 'explanation': explanation}
 
