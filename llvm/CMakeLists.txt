@@ -10,12 +10,10 @@ set(LT_LLVM_INSTALL_DIR "" CACHE PATH "LLVM installation directory")
 # 1.1 Check the "include" directory
 set(LT_LLVM_INCLUDE_DIR "${LT_LLVM_INSTALL_DIR}/include/llvm")
 if(NOT EXISTS "${LT_LLVM_INCLUDE_DIR}")
-message(FATAL_ERROR
-  " LT_LLVM_INSTALL_DIR (${LT_LLVM_INCLUDE_DIR}) is invalid.")
+  message(FATAL_ERROR "LT_LLVM_INSTALL_DIR (${LT_LLVM_INCLUDE_DIR}) is invalid.")
 endif()
 
-# 1.2 Check that the LLVMConfig.cmake file exists (the location depends on the
-# OS)
+# 1.2 Check that the LLVMConfig.cmake file exists (the location depends on the OS)
 set(LT_VALID_INSTALLATION FALSE)
 
 # Ubuntu + Darwin
@@ -28,10 +26,8 @@ if(EXISTS "${LT_LLVM_INSTALL_DIR}/lib64/cmake/llvm/LLVMConfig.cmake")
   set(LT_VALID_INSTALLATION TRUE)
 endif()
 
-if(NOT ${LT_VALID_INSTALLATION})
-  message(FATAL_ERROR
-    "LLVM installation directory, (${LT_LLVM_INSTALL_DIR}), is invalid. Couldn't
-    find LLVMConfig.cmake.")
+if(NOT LT_VALID_INSTALLATION)
+  message(FATAL_ERROR "LLVM installation directory (${LT_LLVM_INSTALL_DIR}) is invalid. Couldn't find LLVMConfig.cmake.")
 endif()
 
 #===============================================================================
@@ -40,10 +36,6 @@ endif()
 #===============================================================================
 # Add the location of LLVMConfig.cmake to CMake search paths (so that
 # find_package can locate it)
-# Note: On Fedora, when using the pre-compiled binaries installed with `dnf`,
-# LLVMConfig.cmake is located in "/usr/lib64/cmake/llvm". But this path is
-# among other paths that will be checked by default when using
-# `find_package(llvm)`. So there's no need to add it here.
 list(APPEND CMAKE_PREFIX_PATH "${LT_LLVM_INSTALL_DIR}/lib/cmake/llvm/")
 
 # The way LLVMConfigVersion.cmake is set up, it will only match MAJOR.MINOR
@@ -79,13 +71,11 @@ set(CMAKE_CXX_STANDARD 17 CACHE STRING "")
 
 # Build type
 if (NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Debug CACHE
-      STRING "Build type (default Debug):" FORCE)
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type (default Debug):" FORCE)
 endif()
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall\
-  -fdiagnostics-color=always")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fdiagnostics-color=always")
 
 # LLVM is normally built without RTTI. Be consistent with that.
 if(NOT LLVM_ENABLE_RTTI)
@@ -97,9 +87,16 @@ endif()
 # builds fine). For consistency, add it here too.
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-fvisibility-inlines-hidden" SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG)
-if (${SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG} EQUAL "1")
+if (${SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG})
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility-inlines-hidden")
 endif()
+
+# Additional Flags for Debugging
+# Ensure that debug symbols are generated and optimizations are disabled
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
+
+# Optionally, add more detailed debugging information
+# set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3 -ggdb")
 
 # Set the build directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
@@ -111,6 +108,6 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib")
 # available for the sub-projects.
 #===============================================================================
 add_subdirectory(lib)
-#add_subdirectory(tools)
-#add_subdirectory(test)
+# add_subdirectory(tools)
+# add_subdirectory(test)
 add_subdirectory(HelloWorld)

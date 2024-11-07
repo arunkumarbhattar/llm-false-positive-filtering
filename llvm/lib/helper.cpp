@@ -12,7 +12,7 @@ bool inTargetFile(const Function &F, StringRef TargetFileName) {
       StringRef FileName = File->getFilename();
       if (FileName.endswith(TargetFileName) ||
           TargetFileName.endswith(FileName)) {
-        // errs() << "Found file " << FileName << "\n";
+         errs() << "Found file " << FileName << "\n";
         return true;
       }
     }
@@ -25,7 +25,7 @@ BasicBlock *findTargetBasicBlock(Function &F, unsigned LineNum) {
     for (auto &I : BB) {
       if (auto DL = I.getDebugLoc()) {
         if (DL.getLine() == LineNum) {
-          // errs() << "Found line " << LineNum << "\n";
+           errs() << "Found line " << LineNum << "\n";
           return &BB;
         }
       }

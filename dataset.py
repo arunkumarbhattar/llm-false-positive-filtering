@@ -184,58 +184,89 @@ class Dataset:
         if llvm_dir is None:
             return "Error: LLVM_DIR environment variable is not set."
 
-        # $LLVM_DIR/bin/opt
+        # Path to the 'opt' tool
         opt_path = os.path.join(llvm_dir, 'bin', 'opt')
 
         cmd = [
             opt_path,
-            "-load-pass-plugin", "/home/mjshen/llm-sast-triage/llvm/build/lib/libVarDefFinder.so",
+            "-load-pass-plugin", "/home/arun/Desktop/llm-false-positive-filtering/llvm/build/lib/libVarDefFinder.so",
             "-passes=variable-def-finder",
             "-disable-output",
-            "-filename", f"{filename}",
-            "-lineno", f"{lineno}",
-            "-variable-name", f"{varname}",
             self.bitcode_path
         ]
 
+        # Create JSON request
+        request_json = json.dumps({
+            "args": {
+                "filename": filename,
+                "lineno": lineno,
+                "variable-name": varname
+            }
+        })
+
         try:
-            result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, check=True)
+            # Pass the JSON request via stdin
+            result = subprocess.run(
+                cmd,
+                input=request_json,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+            print("\n\nResult from running variable_def_finder pass is ---> \n")
+            print(result.stdout)
             stderr_output = result.stderr
             return stderr_output
         except subprocess.CalledProcessError as e:
-            # This will capture the stderr in case of an error
+            # Capture stderr in case of an error
             return f"Command failed with error: {e.stderr}"
         except Exception as e:
             return f"An unexpected error occurred: {e}"
-
     def get_path_constraint(self, filename, lineno):
         llvm_dir = os.environ.get('LLVM_DIR')
         if llvm_dir is None:
             return "Error: LLVM_DIR environment variable is not set."
 
-        # $LLVM_DIR/bin/opt
+        # Path to the 'opt' tool
         opt_path = os.path.join(llvm_dir, 'bin', 'opt')
 
         cmd = [
             opt_path,
-            "-load-pass-plugin", "/home/mjshen/llm-sast-triage/llvm/build/lib/libControlDepGraph.so",
+            "-load-pass-plugin", "/home/arun/Desktop/llm-false-positive-filtering/llvm/build/lib/libControlDepGraph.so",
             "-passes=print<control-dep-graph>",
             "-disable-output",
-            "-filename", f"{filename}",
-            "-lineno", f"{lineno}",
             self.bitcode_path
         ]
 
+        # Create JSON request
+        request_json = json.dumps({
+            "args": {
+                "filename": filename,
+                "lineno": lineno
+            }
+        })
+
         try:
-            result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, check=True)
+            # Pass the JSON request via stdin
+            result = subprocess.run(
+                cmd,
+                input=request_json,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+            print("\n\nResult from running path constraint pass is ---> \n")
+            print(result.stdout)
+
             stderr_output = result.stderr
             return stderr_output
         except subprocess.CalledProcessError as e:
-            # This will capture the stderr in case of an error
+            # Capture stderr in case of an error
             return f"Command failed with error: {e.stderr}"
         except Exception as e:
             return f"An unexpected error occurred: {e}"
-
 
 
 if __name__ == '__main__':

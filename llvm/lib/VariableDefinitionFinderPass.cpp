@@ -55,13 +55,13 @@ struct VariableDefinitionFinderPass
         if (DbgDeclareInst *DbgDeclare = dyn_cast<DbgDeclareInst>(&I)) {
           if (DbgDeclare->getVariable()->getName() == VarName) {
             TargetAlloca = DbgDeclare->getAddress();
-            // errs() << "Found variable '" << VarName << "' with DbgDeclare\n";
+             errs() << "Found variable '" << VarName << "' with DbgDeclare\n";
             goto step2;
           }
         } else if (DbgValueInst *DbgValue = dyn_cast<DbgValueInst>(&I)) {
           if (DbgValue->getVariable()->getName() == VarName) {
             TargetAlloca = DbgValue->getValue();
-            // errs() << "Found variable '" << VarName << "' with DbgValue\n";
+            errs() << "Found variable '" << VarName << "' with DbgValue\n";
             goto step2;
           }
         }
@@ -85,13 +85,12 @@ struct VariableDefinitionFinderPass
           if (Store->getPointerOperand() == TargetAlloca) {
             if (DILocation *Loc = I.getDebugLoc()) {
               unsigned Line = Loc->getLine();
-              // StringRef File = Loc->getFilename();
-              // OS << "Variable '" << VarName << "' defined at line " << Line
-              // << " in file " << File << "\n";
+               StringRef File = Loc->getFilename();
+               OS << "Variable '" << VarName << "' defined at line " << Line
+               << " in file " << File << "\n";
               DefLines.push_back(Line);
             } else {
-              // OS << "Store to variable '" << VarName << "' has no debug
-              // location.\n";
+               OS << "Store to variable '" << VarName << "' has no debug location.\n";
             }
           }
         }

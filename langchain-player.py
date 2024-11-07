@@ -116,8 +116,8 @@ tool_list = [
 
 # LLM
 #model="gpt-3.5-turbo-0125"
-model="gpt-4o-mini-2024-07-18"
-#model="gpt-4o-2024-05-13"
+#model="gpt-4o-mini-2024-07-18"
+model="gpt-4o-2024-05-13"
 #llm = ChatOpenAI(temperature=0.2, model=model).with_structured_output(
 #    Classification
 #)
@@ -127,11 +127,9 @@ llm_with_tools = llm.bind_tools(tool_list)
 chain = chat_prompt | llm_with_tools
 
 llm_tp, llm_fn, llm_fp, llm_tn = 0, 0, 0, 0
-repo_path = "/home/mjshen/IVOS/repos/juliet-test-suite-for-c-cplusplus-v1-3"
-sarif_path = "/home/mjshen/IVOS/repos/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
-bitcode_path = "/home/mjshen/IVOS/repos/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
-#repo_path = "/home/mjshen/IVOS/repos/nuttxspace/nuttx"
-#sarif_path = "/home/mjshen/IVOS/OSSEmbeddedResults/apache/nuttx/7732791cd600fa9b557aecf23ecd5ef8e15359df/cpp-labeled.sarif"
+repo_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3"
+sarif_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
+bitcode_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
 ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
 for srcfile, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
@@ -149,11 +147,12 @@ The warning at a specific source line is false positive if the variable is alway
         "placeholder": []
     }
     # Call variable_def_finder to find all definitions to the variable. Call get_path_constraint on the source line that defines or uses the variable.
-    #print(chat_prompt.invoke(prompt_dict))
+    print(chat_prompt.invoke(prompt_dict))
     got_final_response = False
     while not got_final_response:
         ai_msg = chain.invoke(prompt_dict)
-        print(ai_msg)
+        print("MESSAGE GIVEN BY AI --> ")
+        print(ai_msg.pretty_print())
         prompt_dict["placeholder"].append(ai_msg)
         for tool_call in ai_msg.tool_calls:
             tool_str = tool_call["name"].lower()
