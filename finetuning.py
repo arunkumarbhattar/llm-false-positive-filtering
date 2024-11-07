@@ -495,7 +495,6 @@ model = AutoModelForCausalLM.from_pretrained(
 
 # Prepare the model for inference
 model.eval()
-model.to('cuda')
 model.config.use_cache = True  # Enable cache for inference
 
 # --------------------------
