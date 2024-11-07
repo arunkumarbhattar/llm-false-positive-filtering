@@ -21,8 +21,8 @@ cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/falcon'
 # Define quantization configuration using BitsAndBytesConfig
 quantization_config = BitsAndBytesConfig(
     load_in_8bit=True,
-    llm_int8_threshold=6.0,  # Example parameter; adjust based on your needs
-    llm_int8_has_fp16_weight=True  # Example parameter; adjust based on your needs
+    llm_int8_threshold=6.0,          # Example parameter; adjust based on your needs
+    llm_int8_has_fp16_weight=True     # Example parameter; adjust based on your needs
 )
 
 # Load the tokenizer without trust_remote_code
@@ -65,13 +65,11 @@ peft_config = LoraConfig(
 model = get_peft_model(model, peft_config)
 
 # **Freeze base model parameters to ensure only LoRA parameters are trainable**
-for param in model.base_model.parameters():
-    param.requires_grad = False
-
-# **Ensure LoRA parameters are trainable**
-for param in model.parameters():
-    if not param.requires_grad:
+for name, param in model.named_parameters():
+    if 'lora_' in name:
         param.requires_grad = True
+    else:
+        param.requires_grad = False
 
 # Function to load data from JSONL file
 def load_jsonl(file_path):
@@ -114,7 +112,8 @@ def preprocess_function(examples):
     labels = []
 
     for i in range(len(input_ids)):
-        input_len = len([token for token in tokenized_inputs['input_ids'][i] if token != tokenizer.pad_token_id])
+        # Calculate the actual length of the prompt (excluding padding)
+        input_len = sum(token != tokenizer.pad_token_id for token in tokenized_inputs['input_ids'][i])
         label = input_ids[i].copy()
         # Mask the prompt part in the labels
         label[:input_len] = [-100] * input_len
