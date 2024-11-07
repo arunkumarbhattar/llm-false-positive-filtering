@@ -97,7 +97,7 @@ text_generation_pipeline = pipeline(
     # device=0 if config.device == 'cuda' else -1,  # Removed to prevent device conflict
     torch_dtype=config.torch_dtype,
     trust_remote_code=False,  # Set to False as per warning
-    max_length=2048,
+    max_length=2248,
     truncation=True,  # Explicitly enable truncation
     padding='max_length',  # Ensure consistent padding
 )
