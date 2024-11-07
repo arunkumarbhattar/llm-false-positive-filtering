@@ -1,5 +1,5 @@
 # config.py
-
+import torch
 # Optimization options
 use_quantization = False  # Set to True to enable quantization
 quantization_method = 'bitsandbytes'  # Options: 'bitsandbytes', 'gptq'
