@@ -63,12 +63,12 @@ else:
         trust_remote_code=True
     )
 
-# Create a pipeline
+# Create a pipeline without specifying the 'device' parameter
 text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    device=0 if config.device == 'cuda' else -1,  # HuggingFace uses device indices
+    # device=0 if config.device == 'cuda' else -1,  # Removed to prevent device conflict
     torch_dtype=config.torch_dtype,
     trust_remote_code=True,
     max_length=2048,
