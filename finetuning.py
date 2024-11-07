@@ -1,6 +1,7 @@
 import json
 import os
 import torch
+import argparse  # Added for command-line argument parsing
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -17,6 +18,7 @@ from tqdm import tqdm
 import evaluate  # Ensure you have the `evaluate` library installed
 
 from torch.utils.data import DataLoader
+model_id = 'tiiuae/falcon-40b-instruct'
 
 # --------------------------
 # Set up logging
@@ -29,6 +31,17 @@ logger = logging.getLogger(__name__)
 # --------------------------
 # Run in terminal:
 # pip install --upgrade bitsandbytes
+
+# --------------------------
+# Parse command-line arguments
+# --------------------------
+parser = argparse.ArgumentParser(description="Fine-tune Falcon model with optional retraining.")
+parser.add_argument(
+    "--retrain",
+    action="store_true",
+    help="If set, retrain the model even if a saved model exists."
+)
+args = parser.parse_args()
 
 # --------------------------
 # Specify the cache directory
@@ -46,93 +59,9 @@ bnb_config = BitsAndBytesConfig(
 )
 
 # --------------------------
-# Load the tokenizer without trust_remote_code
+# Define save directory
 # --------------------------
-model_id = 'tiiuae/falcon-40b-instruct'
-
-tokenizer = AutoTokenizer.from_pretrained(
-    model_id,
-    cache_dir=cache_dir
-)
-
-# --------------------------
-# Set the pad_token to eos_token
-# --------------------------
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-# **Set padding_side to 'left' to align with decoder-only architecture**
-tokenizer.padding_side = 'left'
-
-# --------------------------
-# Load the model with quantization_config and without trust_remote_code
-# --------------------------
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    cache_dir=cache_dir,
-    device_map='auto',
-    torch_dtype=torch.float16,
-    quantization_config=bnb_config,
-    trust_remote_code=False  # Removed as per your instruction
-)
-
-# --------------------------
-# Set use_cache to False to avoid incompatibility with gradient checkpointing
-# --------------------------
-model.config.use_cache = False
-
-# --------------------------
-# Set pad_token_id in the model's configuration
-# --------------------------
-model.config.pad_token_id = tokenizer.eos_token_id
-
-# --------------------------
-# Enable gradient checkpointing
-# --------------------------
-model.gradient_checkpointing_enable()
-
-# --------------------------
-# Prepare the model for k-bit (4-bit) training
-# --------------------------
-model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-
-# --------------------------
-# Apply LoRA for efficient fine-tuning
-# --------------------------
-peft_config = LoraConfig(
-    r=16,  # Increased rank for more trainable parameters
-    lora_alpha=32,
-    target_modules=[
-        "query_key_value",
-        "dense",
-        "dense_h_to_4h",
-        "dense_4h_to_h",
-    ],
-    lora_dropout=0.1,  # Increased dropout for better regularization
-    bias="none",
-    task_type=TaskType.CAUSAL_LM
-)
-
-model = get_peft_model(model, peft_config)
-
-# --------------------------
-# Function to print trainable parameters
-# --------------------------
-def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}%"
-    )
-
-print_trainable_parameters(model)
+save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_falcon_codeql'
 
 # --------------------------
 # Function to load data from JSONL file
@@ -152,22 +81,45 @@ def load_jsonl(file_path):
     return {'prompt': prompts, 'completion': completions}
 
 # --------------------------
-# Load your training data
+# Function to dump prompt and completion pairs to JSONL files
 # --------------------------
-data = load_jsonl('fine_tuning_training_data.jsonl')
-dataset = Dataset.from_dict(data)
+def dump_prompt_completion(dataset, filename):
+    """
+    Dumps the prompt and completion pairs to a JSONL file.
+    """
+    # Reload the original dataset before mapping to get exact prompts and completions
+    original_prompts = dataset['prompt']
+    original_completions = dataset['completion']
+
+    with open(filename, 'w') as f:
+        for prompt, completion in zip(original_prompts, original_completions):
+            f.write(json.dumps({
+                'prompt': prompt,
+                'completion': completion
+            }) + '\n')
+    print(f"Dumped {len(original_prompts)} samples to {filename}")
 
 # --------------------------
-# Split the dataset into training and evaluation sets
+# Function to print trainable parameters
 # --------------------------
-split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
-train_dataset = split_dataset['train']
-eval_dataset = split_dataset['test']
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}%"
+    )
 
 # --------------------------
-# Preprocessing function
+# Function to preprocess data
 # --------------------------
-def preprocess_function(examples):
+def preprocess_function(examples, tokenizer):
     """
     Tokenizes the input prompts and completions.
     Masks the prompt part in the labels to ignore them during loss computation.
@@ -210,160 +162,9 @@ def preprocess_function(examples):
     return tokenized_full_texts
 
 # --------------------------
-# Apply the preprocessing
+# Function to evaluate the model
 # --------------------------
-tokenized_train_dataset = train_dataset.map(
-    preprocess_function,
-    batched=True,
-    remove_columns=['prompt', 'completion']
-)
-
-tokenized_eval_dataset = eval_dataset.map(
-    preprocess_function,
-    batched=True,
-    remove_columns=['prompt', 'completion']
-)
-
-# --------------------------
-# Set format for PyTorch tensors
-# --------------------------
-tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-
-# --------------------------
-# Dump prompt and answer pairs to JSONL files
-# --------------------------
-def dump_prompt_completion(dataset, filename):
-    """
-    Dumps the prompt and completion pairs to a JSONL file.
-    """
-    # Reload the original dataset before mapping to get exact prompts and completions
-    original_prompts = dataset['prompt']
-    original_completions = dataset['completion']
-
-    with open(filename, 'w') as f:
-        for prompt, completion in zip(original_prompts, original_completions):
-            f.write(json.dumps({
-                'prompt': prompt,
-                'completion': completion
-            }) + '\n')
-    print(f"Dumped {len(original_prompts)} samples to {filename}")
-
-# Ensure you have the original dataset before mapping
-# Reload the dataset for dumping
-original_data = load_jsonl('fine_tuning_training_data.jsonl')
-original_dataset = Dataset.from_dict(original_data)
-
-# Split original dataset similarly to ensure consistency
-original_split = original_dataset.train_test_split(test_size=0.2, seed=42)
-original_train = original_split['train']
-original_eval = original_split['test']
-
-# Dump training and evaluation data
-dump_prompt_completion(original_train, 'train_prompt_completion.jsonl')
-dump_prompt_completion(original_eval, 'eval_prompt_completion.jsonl')
-
-# --------------------------
-# Verify that there are trainable parameters
-# --------------------------
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Number of trainable parameters: {trainable_params}")
-if trainable_params == 0:
-    raise ValueError("No trainable parameters found. Check if PEFT is applied correctly.")
-
-# --------------------------
-# Define training arguments based on reference code
-# --------------------------
-training_args = TrainingArguments(
-    output_dir='./fine_tuned_model',
-    per_device_train_batch_size=16,        # Increased batch size for better gradient estimates
-    per_device_eval_batch_size=16,         # Increased eval batch size
-    gradient_accumulation_steps=4,         # Adjusted to simulate larger batch size without exceeding GPU memory
-    num_train_epochs=120,                    # Increased epochs for more training time
-    learning_rate=1e-4,                     # Lowered learning rate for finer convergence
-    weight_decay=0.01,                     # As per reference code
-    logging_dir='./logs',                  # Local logging dir
-    logging_steps=50,                      # More frequent logging for better monitoring
-    save_strategy="steps",
-    save_steps=500,                        # Align with eval_steps
-    save_total_limit=3,                    # Increased to keep more checkpoints
-    evaluation_strategy="steps",
-    eval_steps=500,                        # As per reference code
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    fp16=True,                             # Enable mixed precision
-    optim="adamw_torch",                   # Use standard AdamW optimizer
-    lr_scheduler_type="cosine_with_restarts",
-    warmup_ratio=0.1,                      # Increased warmup ratio for better learning rate scheduling
-    max_grad_norm=1.0,                     # Added gradient clipping
-    gradient_checkpointing=True,           # As per reference
-    torch_compile=False,                   # As per reference
-    report_to="none",                      # Disabled reporting (removed TensorBoard)
-)
-
-# --------------------------
-# Define custom callback for detecting abnormal loss
-# --------------------------
-class CustomCallback(TrainerCallback):
-    def on_step_end(self, args, state, control, **kwargs):
-        # Ensure that log_history is non-empty before accessing the last element
-        if not state.log_history:
-            logger.warning(f"At step {state.global_step}: 'log_history' is empty.")
-            return  # Exit early since there's nothing to process
-
-        # Access the last entry in log_history
-        last_log = state.log_history[-1]
-
-        # Check if 'loss' is present in the last log entry
-        if 'loss' in last_log:
-            loss = last_log['loss']
-            logger.debug(f"At step {state.global_step}: loss = {loss}")
-
-            # Detect abnormal loss values
-            if loss > 1e4 or loss < 0:
-                logger.error(f"Abnormal loss detected at step {state.global_step}: {loss}")
-                control.should_terminate_training = True
-        else:
-            logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
-
-# --------------------------
-# Data collator for language modeling
-# --------------------------
-data_collator = DataCollatorForLanguageModeling(
-    tokenizer=tokenizer,
-    mlm=False  # Not using masked language modeling
-)
-
-# --------------------------
-# Initialize the Trainer without compute_metrics
-# --------------------------
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_train_dataset,
-    eval_dataset=tokenized_eval_dataset,
-    data_collator=data_collator,
-    # compute_metrics=compute_metrics,  # Removed to handle evaluation separately
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
-)
-
-# --------------------------
-# Start training
-# --------------------------
-trainer.train()
-
-# --------------------------
-# Save the final model to the new directory, creating it if necessary
-# --------------------------
-save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_falcon_codeql'
-os.makedirs(save_directory, exist_ok=True)
-trainer.save_model(save_directory)
-print(f"Model saved to {save_directory}")
-
-# --------------------------
-# Perform Evaluation with Generation and Compute ROUGE Metrics
-# --------------------------
-def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=16, max_length=512, num_beams=4):
+def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=16, max_new_tokens=512, num_beams=4):
     """
     Generates summaries for the evaluation dataset and computes ROUGE metrics.
     """
@@ -380,9 +181,9 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
     model.eval()
     model.to(device)
 
-    # **Modified Generation Parameters**
+    # Modified Generation Parameters
     generation_kwargs = {
-        "max_new_tokens": 512,  # Specify the number of new tokens to generate
+        "max_new_tokens": max_new_tokens,  # Specify the number of new tokens to generate
         "num_beams": num_beams,
         "early_stopping": True,
         "do_sample": False
@@ -420,25 +221,8 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
 
     return result, generated_summaries, reference_summaries
 
-
 # --------------------------
-# Execute Evaluation
-# --------------------------
-evaluation_results, generated_summaries, reference_summaries = evaluate_model(
-    trainer=trainer,
-    tokenizer=tokenizer,
-    eval_dataset=tokenized_eval_dataset,
-    device='cuda',            # Change to 'cpu' if GPU is not available
-    batch_size=16,
-    max_length=512,
-    num_beams=4
-)
-
-print("Evaluation Results (ROUGE scores):")
-print(evaluation_results)
-
-# --------------------------
-# Optional: Generate and Print Sample Summaries
+# Function to generate and print sample summaries
 # --------------------------
 def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num_samples=5):
     """
@@ -457,7 +241,7 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_length=512,
+                max_new_tokens=512,  # Use max_new_tokens instead of max_length
                 num_beams=4,
                 early_stopping=True,
                 do_sample=False
@@ -478,19 +262,10 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
         print("Reference Summary:")
         print(reference_summary)
 
-# Generate and print sample summaries
-generate_sample_summaries(
-    eval_dataset=tokenized_eval_dataset,
-    tokenizer=tokenizer,
-    model=trainer.model,
-    device='cuda',    # Change to 'cpu' if GPU is not available
-    num_samples=5
-)
-
 # --------------------------
-# Save evaluation summaries to a JSONL file
+# Function to save evaluation summaries to a JSONL file
 # --------------------------
-def save_evaluation_summaries(generated_summaries, reference_summaries, filename, num_samples=100):
+def save_evaluation_summaries(generated_summaries, reference_summaries, eval_dataset, filename, num_samples=100):
     """
     Saves generated and reference summaries to a JSONL file.
     """
@@ -503,10 +278,255 @@ def save_evaluation_summaries(generated_summaries, reference_summaries, filename
             }) + '\n')
     print(f"Saved {min(num_samples, len(generated_summaries))} summaries to {filename}")
 
-# Save evaluation summaries (adjust num_samples as needed)
+# --------------------------
+# Check if a saved model exists and load it if not retraining
+# --------------------------
+if os.path.exists(save_directory) and not args.retrain:
+    logger.info(f"Found a saved model in {save_directory}. Loading the model and skipping training.")
+
+    # Load the tokenizer from the original model_id to ensure consistency
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        cache_dir=cache_dir
+    )
+
+    # Set the pad_token to eos_token if not already set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # **Set padding_side to 'left' to align with decoder-only architecture**
+    tokenizer.padding_side = 'left'
+
+    # Load the model with PEFT configurations
+    model = AutoModelForCausalLM.from_pretrained(
+        save_directory,
+        cache_dir=cache_dir,
+        device_map='auto',
+        torch_dtype=torch.float16,
+        trust_remote_code=False
+    )
+
+    # Set use_cache to False to avoid incompatibility with gradient checkpointing
+    model.config.use_cache = False
+
+    # Set pad_token_id in the model's configuration
+    model.config.pad_token_id = tokenizer.eos_token_id
+
+    # Enable gradient checkpointing
+    model.gradient_checkpointing_enable()
+
+    # Prepare the model for k-bit (4-bit) training
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+    # Apply LoRA configurations
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=[
+            "query_key_value",
+            "dense",
+            "dense_h_to_4h",
+            "dense_4h_to_h",
+        ],
+        lora_dropout=0.1,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM
+    )
+    model = get_peft_model(model, peft_config)
+
+    # Verify trainable parameters
+    print_trainable_parameters(model)
+
+    # Initialize the Trainer with the loaded model
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=None,  # No training dataset since we're skipping training
+        eval_dataset=None,   # Evaluation dataset can be set later if needed
+        data_collator=DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False
+        ),
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
+    )
+
+else:
+    logger.info("No saved model found or retraining requested. Proceeding with training.")
+
+    # --------------------------
+    # Load your training data
+    # --------------------------
+    data = load_jsonl('fine_tuning_training_data.jsonl')
+    dataset = Dataset.from_dict(data)
+
+    # --------------------------
+    # Split the dataset into training and evaluation sets
+    # --------------------------
+    split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
+    train_dataset = split_dataset['train']
+    eval_dataset = split_dataset['test']
+
+    # --------------------------
+    # Apply the preprocessing
+    # --------------------------
+    tokenized_train_dataset = train_dataset.map(
+        lambda examples: preprocess_function(examples, tokenizer),
+        batched=True,
+        remove_columns=['prompt', 'completion']
+    )
+
+    tokenized_eval_dataset = eval_dataset.map(
+        lambda examples: preprocess_function(examples, tokenizer),
+        batched=True,
+        remove_columns=['prompt', 'completion']
+    )
+
+    # --------------------------
+    # Set format for PyTorch tensors
+    # --------------------------
+    tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+
+    # --------------------------
+    # Dump prompt and answer pairs to JSONL files
+    # --------------------------
+    dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
+    dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
+
+    # --------------------------
+    # Verify that there are trainable parameters
+    # --------------------------
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters: {trainable_params}")
+    if trainable_params == 0:
+        raise ValueError("No trainable parameters found. Check if PEFT is applied correctly.")
+
+    # --------------------------
+    # Define training arguments based on reference code
+    # --------------------------
+    training_args = TrainingArguments(
+        output_dir='./fine_tuned_model',
+        per_device_train_batch_size=16,        # Increased batch size for better gradient estimates
+        per_device_eval_batch_size=16,         # Increased eval batch size
+        gradient_accumulation_steps=4,         # Adjusted to simulate larger batch size without exceeding GPU memory
+        num_train_epochs=120,                   # Increased epochs for more training time
+        learning_rate=1e-4,                     # Lowered learning rate for finer convergence
+        weight_decay=0.01,                      # As per reference code
+        logging_dir='./logs',                   # Local logging dir
+        logging_steps=50,                       # More frequent logging for better monitoring
+        save_strategy="steps",
+        save_steps=500,                         # Align with eval_steps
+        save_total_limit=3,                     # Increased to keep more checkpoints
+        evaluation_strategy="steps",
+        eval_steps=500,                         # As per reference code
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        fp16=True,                              # Enable mixed precision
+        optim="adamw_torch",                    # Use standard AdamW optimizer
+        lr_scheduler_type="cosine_with_restarts",
+        warmup_ratio=0.1,                       # Increased warmup ratio for better learning rate scheduling
+        max_grad_norm=1.0,                      # Added gradient clipping
+        gradient_checkpointing=True,            # As per reference
+        torch_compile=False,                    # As per reference
+        report_to="none",                       # Disabled reporting (removed TensorBoard)
+    )
+
+    # --------------------------
+    # Define custom callback for detecting abnormal loss
+    # --------------------------
+    class CustomCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            # Ensure that log_history is non-empty before accessing the last element
+            if not state.log_history:
+                logger.warning(f"At step {state.global_step}: 'log_history' is empty.")
+                return  # Exit early since there's nothing to process
+
+            # Access the last entry in log_history
+            last_log = state.log_history[-1]
+
+            # Check if 'loss' is present in the last log entry
+            if 'loss' in last_log:
+                loss = last_log['loss']
+                logger.debug(f"At step {state.global_step}: loss = {loss}")
+
+                # Detect abnormal loss values
+                if loss > 1e4 or loss < 0:
+                    logger.error(f"Abnormal loss detected at step {state.global_step}: {loss}")
+                    control.should_terminate_training = True
+            else:
+                logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
+
+    # --------------------------
+    # Data collator for language modeling
+    # --------------------------
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # Not using masked language modeling
+    )
+
+    # --------------------------
+    # Apply LoRA for efficient fine-tuning
+    # --------------------------
+    model = get_peft_model(model, peft_config)
+
+    # --------------------------
+    # Initialize the Trainer without compute_metrics
+    # --------------------------
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train_dataset,
+        eval_dataset=tokenized_eval_dataset,
+        data_collator=data_collator,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
+    )
+
+    # --------------------------
+    # Start training
+    # --------------------------
+    trainer.train()
+
+    # --------------------------
+    # Save the final model to the new directory, creating it if necessary
+    # --------------------------
+    os.makedirs(save_directory, exist_ok=True)
+    trainer.save_model(save_directory)
+    print(f"Model saved to {save_directory}")
+
+# --------------------------
+# Perform Evaluation with Generation and Compute ROUGE Metrics
+# --------------------------
+evaluation_results, generated_summaries, reference_summaries = evaluate_model(
+    trainer=trainer,
+    tokenizer=tokenizer,
+    eval_dataset=tokenized_eval_dataset,
+    device='cuda',            # Change to 'cpu' if GPU is not available
+    batch_size=16,
+    max_new_tokens=512,      # Adjust based on your requirements
+    num_beams=4
+)
+
+print("Evaluation Results (ROUGE scores):")
+print(evaluation_results)
+
+# --------------------------
+# Optional: Generate and Print Sample Summaries
+# --------------------------
+generate_sample_summaries(
+    eval_dataset=tokenized_eval_dataset,
+    tokenizer=tokenizer,
+    model=trainer.model,
+    device='cuda',    # Change to 'cpu' if GPU is not available
+    num_samples=5
+)
+
+# --------------------------
+# Save evaluation summaries to a JSONL file
+# --------------------------
 save_evaluation_summaries(
     generated_summaries=generated_summaries,
     reference_summaries=reference_summaries,
+    eval_dataset=tokenized_eval_dataset,
     filename='evaluation_summaries.jsonl',
     num_samples=100
 )
