@@ -92,15 +92,13 @@ Please adhere to the following guidelines:
 # Define the Step 1 Prompt Template with escaped braces
 # Define the Step 1 Prompt Template with all necessary fields
 step1_prompt_template = PromptTemplate(
-    input_variables=["bug_type", "filename", "lineno", "msg", "func_code", "guidance"],
+    input_variables=["bug_type", "msg", "func_code", "guidance"],
     template="""
 You are a software security researcher processing a CodeQL alert.
 
 Given the following bug information:
 
 Type of bug: {bug_type}
-Filename: {filename}
-Line number: {lineno}
 Message: {msg}
 Function code:
 {func_code}
@@ -110,9 +108,9 @@ And the following guidance:
 {guidance}
 
 Available tools:
-- **get_func_definition**: Get the definition of a function. Use when you need to find a function's code.
-- **variable_def_finder**: Find where a variable is defined in the code.
-- **get_path_constraint**: Get the path constraint leading to a specific code line.
+- get_func_definition: Get the definition of a function. Use when you need to find a function's code.
+- variable_def_finder: Find where a variable is defined in the code.
+- get_path_constraint: Get the path constraint leading to a specific code line.
 
 Determine which tools to invoke to assist in triaging this bug.
 """.strip(),
@@ -355,49 +353,3 @@ try:
     logger.info(f"Training data saved to {output_file}")
 except Exception as e:
     logger.error(f"Failed to save training data: {e}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Initialize the tokenizer and model after generating the dataset
-logger.info("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(
-    config.model_name,
-    cache_dir=config.cache_dir,
-)
-tokenizer.pad_token = tokenizer.eos_token  # Set pad_token if not set
-
-logger.info("Loading model...")
-model = AutoModelForCausalLM.from_pretrained(
-    config.model_name,
-    device_map='auto',  # Automatically select device
-    torch_dtype=config.torch_dtype,
-    cache_dir=config.cache_dir,
-)
-
-logger.info("Creating text generation pipeline...")
-text_generation_pipeline = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    torch_dtype=config.torch_dtype,
-    max_new_tokens=512,  # Adjust as needed
-    do_sample=True,
-    temperature=0.3,
-    top_p=0.9,
-    pad_token_id=tokenizer.eos_token_id,  # Set pad_token_id
-)
-
-logger.info("Creating LangChain LLM...")
-llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
-
-# Note: Further processing or fine-tuning can be done after this point

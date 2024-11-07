@@ -55,10 +55,10 @@ cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/falcon'
 # Define quantization configuration using BitsAndBytesConfig for 4-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16  # Can be float16 or bfloat16
+    load_in_8bit=True,
+    bnb_8bit_use_double_quant=True,
+    bnb_8bit_quant_type="nf4",
+    bnb_8bit_compute_dtype=torch.float16
 )
 
 # --------------------------
@@ -190,11 +190,14 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 
     # Modified Generation Parameters
     generation_kwargs = {
-        "max_new_tokens": max_new_tokens,  # Specify the number of new tokens to generate
-        "num_beams": num_beams,
+        "max_new_tokens": 50,  # Reduced to limit output length
+        "num_beams": 1,
         "early_stopping": True,
         "do_sample": False,
-        "pad_token_id": tokenizer.eos_token_id  # Ensure pad_token_id is set
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "top_k": 50,
+        "pad_token_id": tokenizer.eos_token_id
     }
 
     with torch.no_grad():
@@ -211,10 +214,16 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             attention_mask = torch.stack(attention_mask_list).to(model.device)
 
             # Generate completions
-            outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask, **generation_kwargs)
+            outputs = model.generate(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                **generation_kwargs
+            )
+            decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             # Exclude the prompt tokens from the outputs
-            generated_tokens = outputs[:, input_ids.shape[1]:]
-            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
+            response = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+
 
             # Get reference completions
             references = batch['completion']
@@ -312,7 +321,7 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            quantization_config=bnb_config,
+            #quantization_config=bnb_config,
             trust_remote_code=False
         )
 
@@ -347,11 +356,12 @@ def main():
                 outputs = model.generate(
                     input_ids=inputs['input_ids'],
                     attention_mask=inputs['attention_mask'],
-                    max_new_tokens=128,  # Adjust as needed
-                    num_beams=1,         # Adjust as needed
+                    max_new_tokens=128,
+                    num_beams=1,
                     early_stopping=True,
                     do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id  # Ensure pad_token_id is set
+                    temperature=0.1,
+                    pad_token_id=tokenizer.eos_token_id
                 )
             # Exclude the prompt tokens from the outputs
             generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
@@ -499,8 +509,8 @@ def main():
             per_device_train_batch_size=1,          # Adjusted batch size
             per_device_eval_batch_size=1,           # Adjusted eval batch size
             gradient_accumulation_steps=4,          # Adjusted gradient accumulation
-            num_train_epochs=3,                     # Adjusted epochs
-            learning_rate=1e-4,                     # Learning rate
+            num_train_epochs=100,                     # Adjusted epochs
+            learning_rate=2e-5,                     # Learning rate
             weight_decay=0.01,                      # Weight decay
             logging_dir='./logs',                   # Local logging dir
             logging_steps=50,                       # Logging steps
