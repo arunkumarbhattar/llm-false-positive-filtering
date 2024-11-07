@@ -172,6 +172,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     prompts = []
 
     model.eval()
+    # model.to(device)  # Removed: Moving the model to a device is not supported for 4-bit quantized models
 
     # Modified Generation Parameters
     generation_kwargs = {
@@ -209,8 +210,8 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # Compute ROUGE scores
     result = rouge.compute(predictions=generated_summaries, references=reference_summaries, use_stemmer=True)
 
-    # Extract the median scores and scale them
-    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+    # Scale the scores
+    result = {key: value * 100 for key, value in result.items()}
 
     # Round the results for readability
     result = {k: round(v, 4) for k, v in result.items()}
