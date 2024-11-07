@@ -14,19 +14,25 @@ model_name = 'tiiuae/falcon-40b-instruct'
 
 tokenizer = AutoTokenizer.from_pretrained(
     model_name,
-    cache_dir=cache_dir,           # Set cache directory for tokenizer
+    cache_dir=cache_dir,
     trust_remote_code=True
 )
+
+# **Add this line to set the pad_token**
+tokenizer.pad_token = tokenizer.eos_token
 
 # Load the model with 8-bit precision to save memory
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    cache_dir=cache_dir,           # Set cache directory for model
-    device_map='auto',             # Automatically map model to available devices
-    torch_dtype=torch.float16,     # Use float16 for faster training
-    load_in_8bit=True,             # Load model in 8-bit precision
+    cache_dir=cache_dir,
+    device_map='auto',
+    torch_dtype=torch.float16,
+    load_in_8bit=True,
     trust_remote_code=True
 )
+
+# **Update the model's config to set the pad_token_id**
+model.config.pad_token_id = tokenizer.eos_token_id
 
 # Apply LoRA for efficient fine-tuning
 peft_config = LoraConfig(
@@ -65,13 +71,15 @@ def preprocess_function(examples):
         inputs,
         truncation=True,
         max_length=512,  # Adjust based on your data
-        padding=False
+        padding='longest',  # **Ensure consistent padding**
+        return_tensors='pt'
     )
     tokenized_full_texts = tokenizer(
         full_texts,
         truncation=True,
         max_length=512,  # Adjust based on your data
-        padding=False
+        padding='longest',  # **Ensure consistent padding**
+        return_tensors='pt'
     )
 
     input_ids = tokenized_full_texts['input_ids']
@@ -79,14 +87,17 @@ def preprocess_function(examples):
 
     for i in range(len(input_ids)):
         input_len = len(tokenized_inputs['input_ids'][i])
-        label = input_ids[i].copy()
+        label = input_ids[i].clone()
         # Mask the prompt part in the labels
-        label[:input_len] = [-100] * input_len
+        label[:input_len] = -100
         labels.append(label)
 
-    tokenized_inputs['input_ids'] = input_ids
-    tokenized_inputs['attention_mask'] = tokenized_full_texts['attention_mask']
-    tokenized_inputs['labels'] = labels
+    # Prepare the final tokenized inputs
+    tokenized_inputs = {
+        'input_ids': input_ids,
+        'attention_mask': tokenized_full_texts['attention_mask'],
+        'labels': torch.stack(labels)
+    }
 
     return tokenized_inputs
 
@@ -96,6 +107,9 @@ tokenized_dataset = dataset.map(
     batched=True,
     remove_columns=['prompt', 'completion']
 )
+
+# **Set format for PyTorch tensors**
+tokenized_dataset.set_format(type='torch')
 
 # Training arguments
 training_args = TrainingArguments(
@@ -112,7 +126,7 @@ training_args = TrainingArguments(
     optim='paged_adamw_8bit',        # Use 8-bit optimizer from bitsandbytes
     lr_scheduler_type='cosine',      # Learning rate scheduler
     warmup_steps=100,                # Warm-up steps
-    report_to="none"                  # Disable reporting to avoid unnecessary logs
+    report_to="none"                 # Disable reporting to avoid unnecessary logs
 )
 
 # Data collator for language modeling
@@ -126,7 +140,6 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
-    tokenizer=tokenizer,
     data_collator=data_collator,
 )
 
