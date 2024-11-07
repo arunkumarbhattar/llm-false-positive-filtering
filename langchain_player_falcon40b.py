@@ -14,15 +14,12 @@ from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
 )
 logger = logging.getLogger(__name__)
 
-# Load the tokenizer with custom cache directory
+# Load the tokenizer
 logger.info("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
     config.model_name,
@@ -30,47 +27,27 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 tokenizer.pad_token = tokenizer.eos_token  # Set pad_token if not set
 
-# Load the model with optional quantization and custom cache directory
+# Load the model
 logger.info("Loading model...")
-if config.use_quantization:
-    if config.quantization_method == 'bitsandbytes':
-        from transformers import BitsAndBytesConfig
+model = AutoModelForCausalLM.from_pretrained(
+    config.model_name,
+    device_map='auto',  # Use 'auto' to automatically select the device
+    torch_dtype=config.torch_dtype,
+    cache_dir=config.cache_dir,
+)
 
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-        )
-
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            quantization_config=quantization_config,
-            device_map='cuda',
-            torch_dtype=config.torch_dtype,
-            cache_dir=config.cache_dir,
-        )
-    elif config.quantization_method == 'gptq':
-        pass
-    else:
-        raise ValueError(f"Unknown quantization method: {config.quantization_method}")
-else:
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        device_map='cuda',
-        torch_dtype=config.torch_dtype,
-        cache_dir=config.cache_dir,
-    )
-
-# Create a pipeline without specifying the 'device' parameter
+# Create a text generation pipeline
 logger.info("Creating text generation pipeline...")
 text_generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
     torch_dtype=config.torch_dtype,
-    trust_remote_code=False,
-    max_new_tokens=200,
-    truncation=True,
-    padding='max_length',
+    max_new_tokens=512,  # Increase max_new_tokens to allow longer outputs
+    do_sample=True,
+    temperature=0.7,
+    top_p=0.9,
+    pad_token_id=tokenizer.eos_token_id,  # Set pad_token_id
 )
 
 # Create LangChain LLM
@@ -78,7 +55,7 @@ logger.info("Creating LangChain LLM...")
 llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
 # Define tools
-from langchain.tools import StructuredTool
+from langchain.tools import Tool
 
 def get_func_definition(func_name: str) -> str:
     logger.debug(f"Fetching function definition for: {func_name}")
@@ -95,32 +72,23 @@ def get_path_constraint(filename: str, lineno: int) -> str:
     logger.debug(f"Retrieving path constraint for {filename} at line {lineno}")
     return ds.get_path_constraint(filename, lineno)
 
-# Define tools using StructuredTool
-get_func_definition_tool = StructuredTool.from_function(
-    func=get_func_definition,
-    name="get_func_definition",
-    description="Get the definition of a function. Use when you need to find a function's code.",
-)
-
-variable_def_finder_tool = StructuredTool.from_function(
-    func=variable_def_finder,
-    name="variable_def_finder",
-    description=(
-        "Finds all definitions of a local variable in a specified function within a given file. "
-        "Use when you need to find where a variable is defined."
+tools = [
+    Tool(
+        name="get_func_definition",
+        func=get_func_definition,
+        description="Get the definition of a function. Use when you need to find a function's code.",
     ),
-)
-
-get_path_constraint_tool = StructuredTool.from_function(
-    func=get_path_constraint,
-    name="get_path_constraint",
-    description=(
-        "Retrieves the path constraint for a specific source code location. "
-        "Use when you need to understand the conditions leading to a code location."
+    Tool(
+        name="variable_def_finder",
+        func=variable_def_finder,
+        description="Find where a variable is defined in the code.",
     ),
-)
-
-tools = [get_func_definition_tool, variable_def_finder_tool, get_path_constraint_tool]
+    Tool(
+        name="get_path_constraint",
+        func=get_path_constraint,
+        description="Get the path constraint leading to a specific code line.",
+    ),
+]
 
 # Prepare the system prompt
 system_prompt = """
@@ -149,21 +117,19 @@ Use the following format:
 
 Question: the input question you must answer
 
-Thought: your reasoning process
+Thought: your reasoning process. Analyze the code and decide if you need to use any tools.
+
+If you decide to use a tool, output:
 
 Action: the action to take, should be one of [{tool_names}]
 
 Action Input: the input to the action
 
-Observation: the result of the action
+Then wait for the Observation from the tool before continuing your Thought.
 
-... (this Thought/Action/Action Input/Observation can repeat N times)
+If you have enough information, proceed to the final answer.
 
-Thought: I now have enough information
-
-Answer: the final answer to the original question
-
-Remember to use the tools when necessary to find additional information.
+Answer: the final classification as either True Positive (TP) or False Positive (FP), along with a brief explanation.
 """
 
 # Prepare the tool names
@@ -187,9 +153,12 @@ Question: {{input}}
 llm_chain = LLMChain(llm=llm, prompt=prompt_template)
 
 # Create the ZeroShotAgent
-agent = ZeroShotAgent(
-    llm_chain=llm_chain,
+agent = ZeroShotAgent.from_llm_and_tools(
+    llm=llm,
     tools=tools,
+    prefix=system_prompt,
+    format_instructions=format_instructions.replace("{tool_names}", tool_names),
+    max_iterations=5,
     verbose=True,
 )
 
@@ -198,14 +167,13 @@ agent_executor = AgentExecutor.from_agent_and_tools(
     agent=agent,
     tools=tools,
     verbose=True,
-    max_iterations=5,
 )
 
 # Initialize variables
 llm_tp, llm_fn, llm_fp, llm_tn = 0, 0, 0, 0
-repo_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/"
-sarif_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
-bitcode_path = "/scratch/gilbreth/bhattar1/llm-false-positive-filtering/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
+repo_path = "/path/to/repo/"
+sarif_path = "/path/to/sarif_file.sarif"
+bitcode_path = "/path/to/bitcode.bc"
 ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
 logger.info("Starting main processing loop...")
@@ -235,7 +203,7 @@ Function code:
 Guidance on triaging this type of bug: {prompt_dict['guidance']}
 """
 
-    final_input = user_input  # Do not include the system prompt here
+    final_input = user_input
 
     logger.info(f"Running agent for file {srcfile} at line {lineno}...")
     try:
