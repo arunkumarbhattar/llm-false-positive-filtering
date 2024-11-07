@@ -18,7 +18,6 @@ from tqdm import tqdm
 import evaluate  # Ensure you have the `evaluate` library installed
 
 from torch.utils.data import DataLoader
-model_id = 'tiiuae/falcon-40b-instruct'
 
 # --------------------------
 # Set up logging
@@ -164,9 +163,10 @@ def preprocess_function(examples, tokenizer):
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=16, max_new_tokens=512, num_beams=4):
+def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=16, max_new_tokens=512, num_beams=4):
     """
     Generates summaries for the evaluation dataset and computes ROUGE metrics.
+    Also shows ground truth and generated outputs.
     """
     # Load ROUGE metric
     rouge = evaluate.load("rouge")
@@ -176,8 +176,8 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
 
     generated_summaries = []
     reference_summaries = []
+    prompts = []
 
-    model = trainer.model
     model.eval()
     model.to(device)
 
@@ -209,6 +209,9 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
             # Append to lists
             generated_summaries.extend(decoded_preds)
             reference_summaries.extend(decoded_labels)
+            # Also collect prompts
+            batch_prompts = tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
+            prompts.extend(batch_prompts)
 
     # Compute ROUGE scores
     result = rouge.compute(predictions=generated_summaries, references=reference_summaries, use_stemmer=True)
@@ -219,7 +222,7 @@ def evaluate_model(trainer, tokenizer, eval_dataset, device='cuda', batch_size=1
     # Round the results for readability
     result = {k: round(v, 4) for k, v in result.items()}
 
-    return result, generated_summaries, reference_summaries
+    return result, generated_summaries, reference_summaries, prompts
 
 # --------------------------
 # Function to generate and print sample summaries
@@ -229,6 +232,8 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
     Generates and prints sample summaries from the evaluation dataset.
     """
     print("\nSample Generated Summaries:")
+    model.eval()
+    model.to(device)
     for i in range(num_samples):
         sample = eval_dataset[i]
         prompt = sample['prompt']
@@ -265,18 +270,74 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
 # --------------------------
 # Function to save evaluation summaries to a JSONL file
 # --------------------------
-def save_evaluation_summaries(generated_summaries, reference_summaries, eval_dataset, filename, num_samples=100):
+def save_evaluation_summaries(generated_summaries, reference_summaries, prompts, filename, num_samples=100):
     """
     Saves generated and reference summaries to a JSONL file.
     """
     with open(filename, 'w') as f:
         for i in tqdm(range(min(num_samples, len(generated_summaries))), desc=f"Saving summaries to {filename}"):
             f.write(json.dumps({
-                'prompt': eval_dataset[i]['prompt'],
+                'prompt': prompts[i],
                 'reference_summary': reference_summaries[i],
                 'generated_summary': generated_summaries[i]
             }) + '\n')
     print(f"Saved {min(num_samples, len(generated_summaries))} summaries to {filename}")
+
+# --------------------------
+# Load the tokenizer
+# --------------------------
+model_id = 'tiiuae/falcon-40b-instruct'
+tokenizer = AutoTokenizer.from_pretrained(
+    model_id,
+    cache_dir=cache_dir
+)
+
+# Set the pad_token to eos_token if not already set
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Set padding_side to 'left' to align with decoder-only architecture
+tokenizer.padding_side = 'left'
+
+# --------------------------
+# Load your training data
+# --------------------------
+data = load_jsonl('fine_tuning_training_data.jsonl')
+dataset = Dataset.from_dict(data)
+
+# --------------------------
+# Split the dataset into training and evaluation sets
+# --------------------------
+split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
+train_dataset = split_dataset['train']
+eval_dataset = split_dataset['test']
+
+# --------------------------
+# Apply the preprocessing
+# --------------------------
+tokenized_train_dataset = train_dataset.map(
+    lambda examples: preprocess_function(examples, tokenizer),
+    batched=True,
+    remove_columns=['prompt', 'completion']
+)
+
+tokenized_eval_dataset = eval_dataset.map(
+    lambda examples: preprocess_function(examples, tokenizer),
+    batched=True,
+    remove_columns=['prompt', 'completion']
+)
+
+# --------------------------
+# Set format for PyTorch tensors
+# --------------------------
+tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+
+# --------------------------
+# Dump prompt and answer pairs to JSONL files
+# --------------------------
+dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
+dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
 
 # --------------------------
 # Check if a saved model exists and load it if not retraining
@@ -284,123 +345,68 @@ def save_evaluation_summaries(generated_summaries, reference_summaries, eval_dat
 if os.path.exists(save_directory) and not args.retrain:
     logger.info(f"Found a saved model in {save_directory}. Loading the model and skipping training.")
 
-    # Load the tokenizer from the original model_id to ensure consistency
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        cache_dir=cache_dir
-    )
-
-    # Set the pad_token to eos_token if not already set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # **Set padding_side to 'left' to align with decoder-only architecture**
-    tokenizer.padding_side = 'left'
-
-    # Load the model with PEFT configurations
+    # Load the model from the save_directory with quantization_config
     model = AutoModelForCausalLM.from_pretrained(
         save_directory,
         cache_dir=cache_dir,
         device_map='auto',
         torch_dtype=torch.float16,
+        quantization_config=bnb_config,  # Added this line
         trust_remote_code=False
     )
 
-    # Set use_cache to False to avoid incompatibility with gradient checkpointing
-    model.config.use_cache = False
-
-    # Set pad_token_id in the model's configuration
-    model.config.pad_token_id = tokenizer.eos_token_id
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-
-    # Prepare the model for k-bit (4-bit) training
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-
-    # Apply LoRA configurations
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=[
-            "query_key_value",
-            "dense",
-            "dense_h_to_4h",
-            "dense_4h_to_h",
-        ],
-        lora_dropout=0.1,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM
-    )
-    model = get_peft_model(model, peft_config)
-
-    # Verify trainable parameters
-    print_trainable_parameters(model)
-
-    # Initialize the Trainer with the loaded model
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=None,  # No training dataset since we're skipping training
-        eval_dataset=None,   # Evaluation dataset can be set later if needed
-        data_collator=DataCollatorForLanguageModeling(
-            tokenizer=tokenizer,
-            mlm=False
-        ),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
-    )
 
 else:
     logger.info("No saved model found or retraining requested. Proceeding with training.")
 
-    # --------------------------
-    # Load your training data
-    # --------------------------
-    data = load_jsonl('fine_tuning_training_data.jsonl')
-    dataset = Dataset.from_dict(data)
-
-    # --------------------------
-    # Split the dataset into training and evaluation sets
-    # --------------------------
-    split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
-    train_dataset = split_dataset['train']
-    eval_dataset = split_dataset['test']
-
-    # --------------------------
-    # Apply the preprocessing
-    # --------------------------
-    tokenized_train_dataset = train_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=['prompt', 'completion']
+    # Load the model from the save_directory with quantization_config
+    model = AutoModelForCausalLM.from_pretrained(
+        save_directory,
+        cache_dir=cache_dir,
+        device_map='auto',
+        torch_dtype=torch.float16,
+        quantization_config=bnb_config,  # Added this line
+        trust_remote_code=False
     )
 
-    tokenized_eval_dataset = eval_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=['prompt', 'completion']
-    )
 
-    # --------------------------
-    # Set format for PyTorch tensors
-    # --------------------------
-    tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+# Set use_cache to False to avoid incompatibility with gradient checkpointing
+model.config.use_cache = False
 
-    # --------------------------
-    # Dump prompt and answer pairs to JSONL files
-    # --------------------------
-    dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
-    dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
+# Set pad_token_id in the model's configuration
+model.config.pad_token_id = tokenizer.eos_token_id
 
-    # --------------------------
-    # Verify that there are trainable parameters
-    # --------------------------
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Number of trainable parameters: {trainable_params}")
-    if trainable_params == 0:
-        raise ValueError("No trainable parameters found. Check if PEFT is applied correctly.")
+# Enable gradient checkpointing
+model.gradient_checkpointing_enable()
 
+# Prepare the model for k-bit (4-bit) training
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+# Apply LoRA configurations
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=[
+        "query_key_value",
+        "dense",
+        "dense_h_to_4h",
+        "dense_4h_to_h",
+    ],
+    lora_dropout=0.1,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM
+)
+
+# Apply PEFT model
+model = get_peft_model(model, peft_config)
+
+# Verify trainable parameters
+print_trainable_parameters(model)
+
+# --------------------------
+# If training is needed
+# --------------------------
+if not (os.path.exists(save_directory) and not args.retrain):
     # --------------------------
     # Define training arguments based on reference code
     # --------------------------
@@ -409,7 +415,7 @@ else:
         per_device_train_batch_size=16,        # Increased batch size for better gradient estimates
         per_device_eval_batch_size=16,         # Increased eval batch size
         gradient_accumulation_steps=4,         # Adjusted to simulate larger batch size without exceeding GPU memory
-        num_train_epochs=120,                   # Increased epochs for more training time
+        num_train_epochs=10,                   # Increased epochs for more training time
         learning_rate=1e-4,                     # Lowered learning rate for finer convergence
         weight_decay=0.01,                      # As per reference code
         logging_dir='./logs',                   # Local logging dir
@@ -465,12 +471,7 @@ else:
     )
 
     # --------------------------
-    # Apply LoRA for efficient fine-tuning
-    # --------------------------
-    model = get_peft_model(model, peft_config)
-
-    # --------------------------
-    # Initialize the Trainer without compute_metrics
+    # Initialize the Trainer
     # --------------------------
     trainer = Trainer(
         model=model,
@@ -479,7 +480,9 @@ else:
         eval_dataset=tokenized_eval_dataset,
         data_collator=data_collator,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
+        tokenizer=tokenizer,  # This ensures the tokenizer is saved with the model
     )
+
 
     # --------------------------
     # Start training
@@ -487,17 +490,20 @@ else:
     trainer.train()
 
     # --------------------------
-    # Save the final model to the new directory, creating it if necessary
+    # Save the final model to the save_directory
     # --------------------------
     os.makedirs(save_directory, exist_ok=True)
     trainer.save_model(save_directory)
+    tokenizer.save_pretrained(save_directory)
     print(f"Model saved to {save_directory}")
+else:
+    logger.info("Skipping training.")
 
 # --------------------------
 # Perform Evaluation with Generation and Compute ROUGE Metrics
 # --------------------------
-evaluation_results, generated_summaries, reference_summaries = evaluate_model(
-    trainer=trainer,
+evaluation_results, generated_summaries, reference_summaries, prompts = evaluate_model(
+    model=model,
     tokenizer=tokenizer,
     eval_dataset=tokenized_eval_dataset,
     device='cuda',            # Change to 'cpu' if GPU is not available
@@ -510,12 +516,26 @@ print("Evaluation Results (ROUGE scores):")
 print(evaluation_results)
 
 # --------------------------
+# Show ground truth and generated outputs
+# --------------------------
+print("\nGround Truth vs Generated Summaries:")
+num_samples_to_show = 5
+for i in range(num_samples_to_show):
+    print(f"\nSample {i+1}:")
+    print("Prompt:")
+    print(prompts[i])
+    print("Ground Truth:")
+    print(reference_summaries[i])
+    print("Generated Summary:")
+    print(generated_summaries[i])
+
+# --------------------------
 # Optional: Generate and Print Sample Summaries
 # --------------------------
 generate_sample_summaries(
     eval_dataset=tokenized_eval_dataset,
     tokenizer=tokenizer,
-    model=trainer.model,
+    model=model,
     device='cuda',    # Change to 'cpu' if GPU is not available
     num_samples=5
 )
@@ -526,7 +546,31 @@ generate_sample_summaries(
 save_evaluation_summaries(
     generated_summaries=generated_summaries,
     reference_summaries=reference_summaries,
-    eval_dataset=tokenized_eval_dataset,
+    prompts=prompts,
     filename='evaluation_summaries.jsonl',
     num_samples=100
 )
+
+# --------------------------
+# Chat prompt for the user
+# --------------------------
+print("\nEnter 'exit' to quit the chat.")
+model.eval()
+model.to('cuda')  # Ensure model is on the correct device
+while True:
+    user_input = input("User: ")
+    if user_input.lower() == 'exit':
+        break
+    # Tokenize the user input
+    inputs = tokenizer(user_input, return_tensors="pt").to('cuda')
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            num_beams=4,
+            early_stopping=True,
+            do_sample=False
+        )
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(f"Model: {response}")
+
