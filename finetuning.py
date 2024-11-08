@@ -552,30 +552,29 @@ def main():
         # Define training arguments
         # --------------------------
         training_args = TrainingArguments(
-            output_dir='./fine_tuned_model',
-            per_device_train_batch_size=1,
-            per_device_eval_batch_size=1,
-            gradient_accumulation_steps=4,
-            num_train_epochs=10,  # Adjust epochs as needed
-            learning_rate=2e-5,
-            weight_decay=0.01,
-            logging_dir='./logs',
-            logging_steps=50,
-            save_strategy="steps",
-            save_steps=500,
-            save_total_limit=3,
-            evaluation_strategy="steps",
-            eval_steps=500,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            fp16=True,
-            optim="adamw_torch",
-            lr_scheduler_type="cosine_with_restarts",
-            warmup_ratio=0.1,
-            max_grad_norm=1.0,
-            gradient_checkpointing=True,
-            torch_compile=False,
-            report_to="none",
+            output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
+            per_device_train_batch_size=1,              # Keep batch size small due to potential GPU memory constraints
+            per_device_eval_batch_size=1,               # Same as training batch size
+            gradient_accumulation_steps=8,              # Increase to simulate a larger effective batch size
+            num_train_epochs=200,                        # Significantly increase epochs to allow extensive training
+            learning_rate=1e-5,                          # Lower learning rate for finer weight updates
+            weight_decay=0.0,                            # Remove weight decay to reduce regularization
+            logging_dir='./logs',                        # Directory for logging
+            logging_steps=10,                            # Increase logging frequency for better monitoring
+            save_strategy="steps",                       # Save checkpoints based on steps
+            save_steps=100,                              # Save every 100 steps to capture more checkpoints
+            save_total_limit=None,                       # Allow unlimited checkpoints to prevent overwriting
+            evaluation_strategy="no",                    # Disable evaluation to focus solely on training accuracy
+            load_best_model_at_end=False,                # Do not load the best model based on evaluation (since eval is disabled)
+            # metric_for_best_model="eval_loss",         # Not needed as evaluation is disabled
+            fp16=True,                                   # Use mixed precision for faster training
+            optim="adamw_torch",                         # Use AdamW optimizer
+            lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
+            warmup_steps=100,                            # Minimal warmup steps to stabilize training start
+            max_grad_norm=0.0,                            # Disable gradient clipping to allow larger gradient updates
+            gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
+            torch_compile=False,                         # Disable Torch compilation for compatibility
+            report_to="none",                            # Disable reporting to external systems
         )
 
         # --------------------------
