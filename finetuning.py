@@ -564,7 +564,7 @@ def main():
             save_strategy="steps",                       # Save checkpoints based on steps
             save_steps=100,                              # Save every 100 steps to capture more checkpoints
             save_total_limit=None,                       # Allow unlimited checkpoints to prevent overwriting
-            evaluation_strategy="no",                    # Disable evaluation to focus solely on training accuracy
+            evaluation_strategy="steps",                    # Disable evaluation to focus solely on training accuracy
             load_best_model_at_end=True,                # Do not load the best model based on evaluation (since eval is disabled)
             # metric_for_best_model="eval_loss",         # Not needed as evaluation is disabled
             fp16=True,                                   # Use mixed precision for faster training
