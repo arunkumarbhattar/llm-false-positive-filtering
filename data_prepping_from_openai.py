@@ -1,18 +1,17 @@
 import config
-from langchain.llms import HuggingFacePipeline
-from langchain.prompts import PromptTemplate, ChatPromptTemplate
-from langchain.tools import Tool
 import torch
-import dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import logging
 import re
-from tqdm import tqdm
 import json
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
+from tqdm import tqdm
+from typing import List, Any
+
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.agents import initialize_agent, AgentType
+from langchain.tools import tool
+from langchain.schema import AgentAction, AgentFinish
+from langchain.pydantic_v1 import BaseModel, Field
 
 import dataset
 
@@ -23,134 +22,129 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class ResponseFormatter(BaseModel):
-    """Always use this tool to structure your response to the user."""
+# Initialize the dataset
+repo_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3"
+sarif_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
+bitcode_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
 
-    is_bug: bool = Field(
-        description="Classification result. True for true positive, False for false positive"
-    )
-    explaination: str = Field(description="Explain your reasons for classification")
+ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
-# Define tools
+# Define tools using the @tool decorator
+@tool
 def get_func_definition(func_name: str) -> str:
-    logger.debug(f"Fetching function definition for: {func_name}")
+    """Get the definition of a function.
+    Use the tool when you want to lookup the definition of a function
+    whose function body has not been provided to you,
+    AND you think the definition of this function is crucial to your decision.
+    """
+
     res = ds.get_function_definition(func_name)
     if not res or len(res) == 0:
         return f"The definition of {func_name} is unavailable."
     return res[:10000]
 
+@tool
 def variable_def_finder(filename: str, lineno: int, varname: str) -> str:
-    logger.debug(f"Finding definitions for variable '{varname}' in {filename} at line {lineno}")
+    """
+    Finds all definitions of a local variable in a specified function within a given file.
+
+    Parameters:
+    -----------
+    filename : str
+        The name (and path, if necessary) of the source file to analyze.
+    lineno : int
+        The line number in the source file where the function containing the variable is defined.
+    varname : str
+        The name of the local variable whose definitions are to be found.
+
+    Returns:
+    --------
+    str
+        A string containing the details of the line numbers of all definitions of the specified
+        variable. If no definitions are found, the function may return an empty string or an error
+        message depending on the analysis result.
+    """
     return ds.variable_def_finder(filename, lineno, varname)
 
+@tool
 def get_path_constraint(filename: str, lineno: int) -> str:
-    logger.debug(f"Retrieving path constraint for {filename} at line {lineno}")
+    """
+    Retrieves the path constraint for a specific source code location.
+
+    This function analyzes the code at the given file and line number, extracting the
+    logical path constraint that leads to the specified location. Path constraints
+    are the conditions that must be true for the execution to reach the given line
+    in the code.
+
+    Parameters:
+    -----------
+    filename : str
+        The name (and path, if necessary) of the source file to analyze.
+    lineno : int
+        The line number in the source file for which the path constraint is to be determined.
+
+    Returns:
+    --------
+    str
+        A string representation of the path constraint that leads to the specified line.
+        If no constraint is found or the analysis fails, an empty string or a relevant
+        error message may be returned.
+    """
     return ds.get_path_constraint(filename, lineno)
 
+# Create the list of tools (but we won't execute them)
 tools = [
-    Tool(
-        name="get_func_definition",
-        func=get_func_definition,
-        description="Get the definition of a function. Use when you need to find a function's code.",
-    ),
-    Tool(
-        name="variable_def_finder",
-        func=variable_def_finder,
-        description="Find where a variable is defined in the code.",
-    ),
-    Tool(
-        name="get_path_constraint",
-        func=get_path_constraint,
-        description="Get the path constraint leading to a specific code line.",
-    ),
+    get_func_definition,
+    variable_def_finder,
+    get_path_constraint
 ]
 
-# Define the system prompt
-chat_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", """
+# Initialize the LLM
+model = "gpt-4o-2024-05-13"  # Replace with your actual model name
+llm = ChatOpenAI(temperature=0.2, model=model)
+
+# Define the agent's system message (prompt)
+system_message = """
 You are a software security researcher tasked with processing alerts generated from CodeQL, a static analysis tool.
 
 The user will provide the alert to be processed. It contains the type of bug the CodeQL rule intends to detect, the source line of the potential bug, the message describing the bug, followed by the code of the function containing the bug, with line numbers on the left. The language of code is C/C++.
 
 Please adhere to the following guidelines:
-
 * Concentrate only on the bug type and location specified by the user. Do NOT consider or report on other potential bugs or issues outside the provided scope.
-
 * Do NOT assume or speculate about any future changes or modifications to the code. Your responses should strictly reflect the current state of the code as provided.
-
 * Do NOT hurry to make a decision when uncertain. Use the provided tools to seek clarification or obtain necessary information.
-
 * In C and C++, defining a variable with the static keyword inside a function only affects that specific variable. The use of static ensures that this variable retains its value between function calls and is not reinitialized on subsequent calls. However, this behavior does not apply to other variables in the same function unless they are also explicitly defined with static. Each variable's storage class and lifetime are independent of others in the function, and only variables defined with static retain their values across multiple calls.
-        """
-         ),
-        ("user", "Type of bug: {bug_type}\nLine number: {lineno}\nMessage: {msg}\nFunction code:\n{func_code}\n\nGuidance on triaging this type of bug: {guidance}"),
-        ("placeholder", "{placeholder}")
-    ]
+
+**Instructions:**
+
+1. **Tool Selection**: Plan which tools to invoke to assist in triaging this bug. Do not execute any tool. You might need 1 or more tools at the same time. Provide your answer in a comma seperated format
+
+2. **Reasoning**: Provide the reasoning behind your selection in plain English, using a chain-of-thought format.
+
+""".strip()
+
+agent_kwargs = {
+    "system_message": system_message
+}
+
+# Initialize the agent with the tools and system message, but prevent tool execution
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent=AgentType.OPENAI_FUNCTIONS,
+    agent_kwargs=agent_kwargs,
+    agent_executor_kwargs={
+        "return_intermediate_steps": True,
+        "max_iterations": 1  # Ensure the agent does not attempt to execute tools
+    },
+    verbose=True,
 )
-
-# Define the Step 1 Prompt Template with escaped braces
-# Define the Step 1 Prompt Template with all necessary fields
-step1_prompt_template = PromptTemplate(
-    input_variables=["bug_type", "msg", "func_code", "guidance"],
-    template="""
-You are a software security researcher processing a CodeQL alert.
-
-Given the following bug information:
-
-Type of bug: {bug_type}
-Message: {msg}
-Function code:
-{func_code}
-
-Guidance:
-
-- {guidance}
-
-Available tools:
-
-- get_func_definition: Get the definition of a function. Use when you need to find a function's code.
-- variable_def_finder: Find where a variable is defined in the code.
-- get_path_constraint: Get the path constraint leading to a specific code line.
-
-Determine which tools to invoke to assist in triaging this bug.
-Provide your answer as a comma-separated list of tool names.
-""".strip(),
-)
-
-model="gpt-4o-2024-05-13"
-# Initialize the dataset before initializing the tokenizer and model
-repo_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3"
-sarif_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/cpp-labeled-202408221915.sarif"
-bitcode_path = "/home/arun/Downloads/juliet-test-suite-for-c-cplusplus-v1-3/C/testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_s01.bc"
-
-# Initialize the dataset
-ds = dataset.Dataset(repo_path, sarif_path, bitcode_path)
 
 logger.info("Starting main processing loop...")
-
-toolstr2callable = {
-    "get_func_definition": get_func_definition,
-    "variable_def_finder": variable_def_finder,
-    "get_path_constraint": get_path_constraint,
-    "responseformatter": ResponseFormatter
-}
-tool_list = [
-    get_func_definition,
-    variable_def_finder,
-    get_path_constraint,
-    ResponseFormatter
-]
-
-llm = ChatOpenAI(temperature=0.2, model=model)
-llm_with_tools = llm.bind_tools(tool_list)
-
-chain = chat_prompt | llm_with_tools
 
 # Initialize training data list
 data = []
 
-# Main loop to process each CodeQL alert
 # Main loop to process each CodeQL alert
 for srcfile, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
     if not srcfile.endswith("_11.c"):
@@ -159,7 +153,7 @@ for srcfile, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
 
     prompt_dict = {
         "bug_type": "Potentially uninitialized local variable",
-        "filename": srcfile,  # Will exclude this in bug_info
+        "filename": srcfile,
         "lineno": lineno,
         "msg": msg,
         "func_code": func,
@@ -168,95 +162,53 @@ The warning at a specific source line is a false positive if the variable is alw
 """,
     }
 
-    # Exclude filename from bug_info
-    bug_info = f"""Type of bug: {prompt_dict['bug_type']}
+    logger.info(f"Processing file {srcfile} at line {lineno}...")
+
+    try:
+        # Prepare the user message
+        user_message = f"""
+Type of bug: {prompt_dict['bug_type']}
 Line number: {prompt_dict['lineno']}
 Message: {prompt_dict['msg']}
 Function code:
 {prompt_dict['func_code']}
+
+Guidance on triaging this type of bug: {prompt_dict['guidance'].strip()}
 """
-
-    guidance = prompt_dict['guidance']
-
-    tool_names = ", ".join([tool.name for tool in tools])
-
-    # Step 1: Determine which tools to call and their arguments
-    # Step 1: Determine which tools to call and their arguments
-    prompt_dict = {
-        "bug_type": prompt_dict['bug_type'],
-        "filename": srcfile,
-        "lineno": lineno,
-        "msg": msg,
-        "func_code": func,
-        "guidance": """
-The warning at a specific source line is false positive if the variable is always initialized along all the paths that reach that line.
-""",
-        "placeholder": []
-    }
-
-
-    logger.info(f"Running Step 1 LLM for file {srcfile} at line {lineno}...")
-    try:
-        # Invoke the LLM with the formatted prompt
-        step1_response = chain.invoke(prompt_dict)
+        # Run the agent (without executing tools)
+        result = agent.run(user_message)
     except Exception as e:
-        logger.error(f"Error running Step 1 LLM: {e}")
+        logger.error(f"Error running agent: {e}")
         continue
 
-    logger.info("Step 1 LLM response received.")
-    logger.debug(f"Step 1 Response: {step1_response}")
+    response = result  # The agent's response
 
-    # Extract tools selected as ground truth
-    # Convert it to JSON string
-    try:
-        step1_response_json = step1_response.to_json()
-    except AttributeError as e:
-        logger.error(f"Error converting AIMessage to JSON: {e}")
-        logger.debug(f"step1_response: {step1_response}")
-        continue  # Skip to the next iteration or handle accordingly
-
-    # Parse the JSON string into a Python dictionary
-    try:
-        step1_response_dict = step1_response_json.values()
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decoding failed: {e}")
-        logger.debug(f"step1_response_json: {step1_response_json}")
-        continue  # Skip to the next iteration or handle accordingly
-
-    # Convert dict_values to a list to access elements by index
-    step1_response_values = list(step1_response_dict)
-
-    # Safely access the fourth element (index 3) which contains the main response dictionary
-    if len(step1_response_values) > 3:
-        response_section = step1_response_values[3]
+    # First, try to match "Tools to invoke: tool1, tool2"
+    tools_selected_match = re.search(r"Tools to invoke:\s*([^\n]*)", response, re.IGNORECASE)
+    if tools_selected_match:
+        # Split the tools by comma and strip any surrounding whitespace
+        tools_selected_str = ", ".join([tool.strip() for tool in tools_selected_match.group(1).split(",")])
+        # Remove the "Tools to invoke: ..." line from reasoning
+        reasoning = response.replace(tools_selected_match.group(0), "").strip()
     else:
-        response_section = {}
-        logger.warning("Expected at least 4 elements in step1_response_dict, but got fewer.")
+        tools_selected_str = ""
+        reasoning = response.strip()
 
-    # Now safely access the 'tool_calls' key
-    tool_calls = response_section.get('tool_calls', [])
+    # Optionally, ensure that reasoning starts after "Reasoning:"
+    reasoning_match = re.search(r"Reasoning:\s*(.*)", reasoning, re.DOTALL | re.IGNORECASE)
+    if reasoning_match:
+        reasoning = reasoning_match.group(1).strip()
 
-    if not tool_calls:
-        # Fallback to 'additional_kwargs' if 'tool_calls' not found at the top level
-        tool_calls = response_section.get('additional_kwargs', {}).get('tool_calls', [])
+    # Prepare the instruction, input, and output for training data
+    instruction = "Analyze the provided CodeQL alert and determine which tools to invoke to assist in triaging the bug. Provide the tools and your reasoning."
+    input_text = user_message.strip()
+    output_text = response.strip()
 
-    # Extract tool names from tool_calls
-    tools_selected = ", ".join([tool_call.get("name", "unknown_tool") for tool_call in tool_calls])
-
-    # Populate the step1_prompt using the template
-    step1_prompt = step1_prompt_template.format(
-        bug_type="Potentially uninitialized local variable",
-        filename=srcfile,
-        lineno=lineno,
-        msg=msg,
-        func_code=func,
-        guidance = "The warning at a specific source line is false positive if the variable is always initialized along all the paths that reach that line."
-    )
-
-    # Add Step 1 to training data
+    # Add to training data
     data.append({
-        "prompt": step1_prompt,
-        "completion": tools_selected
+        "instruction": instruction,
+        "input": input_text,
+        "output": output_text
     })
 
 # Save the data to a JSON Lines file suitable for fine-tuning

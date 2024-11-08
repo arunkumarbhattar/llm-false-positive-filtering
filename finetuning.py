@@ -1,7 +1,6 @@
 import json
 import os
 import re
-
 import torch
 import argparse
 from transformers import (
@@ -73,16 +72,20 @@ save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_falcon_codeql'
 # --------------------------
 def load_jsonl(file_path):
     """
-    Loads prompt and completion pairs from a JSONL file.
-    Each line in the file should be a JSON object with 'prompt' and 'completion' keys.
+    Loads instruction, input, and output pairs from a JSONL file.
+    Combines 'instruction' and 'input' to create 'prompt', and uses 'output' as 'completion'.
     """
     prompts = []
     completions = []
     with open(file_path, 'r') as f:
         for line in f:
             entry = json.loads(line)
-            prompts.append(entry['prompt'])
-            completions.append(entry['completion'])
+            instruction = entry.get('instruction', '')
+            input_text = entry.get('input', '')
+            output = entry.get('output', '')
+            prompt = instruction.strip() + '\n' + input_text.strip()
+            prompts.append(prompt)
+            completions.append(output)
     return {'prompt': prompts, 'completion': completions}
 
 # --------------------------
@@ -92,16 +95,16 @@ def dump_prompt_completion(dataset, filename):
     """
     Dumps the prompt and completion pairs to a JSONL file.
     """
-    original_prompts = dataset['prompt']
-    original_completions = dataset['completion']
+    prompts = dataset['prompt']
+    completions = dataset['completion']
 
     with open(filename, 'w') as f:
-        for prompt, completion in zip(original_prompts, original_completions):
+        for prompt, completion in zip(prompts, completions):
             f.write(json.dumps({
                 'prompt': prompt,
                 'completion': completion
             }) + '\n')
-    print(f"Dumped {len(original_prompts)} samples to {filename}")
+    print(f"Dumped {len(prompts)} samples to {filename}")
 
 # --------------------------
 # Function to print trainable parameters
@@ -129,15 +132,15 @@ def preprocess_function(examples, tokenizer):
     Tokenizes the input prompts and completions.
     Masks the prompt part in the labels to ignore them during loss computation.
     """
-    inputs = examples['prompt']
-    outputs = examples['completion']
-    full_texts = [inp + out for inp, out in zip(inputs, outputs)]
+    prompts = examples['prompt']
+    completions = examples['completion']
+    full_texts = [prompt + '\n' + completion for prompt, completion in zip(prompts, completions)]
 
     # Tokenize prompts
-    tokenized_inputs = tokenizer(
-        inputs,
+    tokenized_prompts = tokenizer(
+        prompts,
         truncation=True,
-        max_length=512,  # Adjust based on your data
+        max_length=1024,  # Adjust based on your data
         padding='max_length'
     )
 
@@ -145,7 +148,7 @@ def preprocess_function(examples, tokenizer):
     tokenized_full_texts = tokenizer(
         full_texts,
         truncation=True,
-        max_length=512,  # Adjust based on your data
+        max_length=1024,  # Adjust based on your data
         padding='max_length'
     )
 
@@ -155,17 +158,19 @@ def preprocess_function(examples, tokenizer):
 
     for i in range(len(input_ids)):
         # Calculate the actual length of the prompt (excluding padding)
-        input_len = sum(token != tokenizer.pad_token_id for token in tokenized_inputs['input_ids'][i])
+        prompt_len = sum(token != tokenizer.pad_token_id for token in tokenized_prompts['input_ids'][i])
         label = input_ids[i].copy()
         # Mask the prompt part in the labels
-        label[:input_len] = [-100] * input_len
+        label[:prompt_len] = [-100] * prompt_len
         labels.append(label)
 
     # Prepare the final tokenized inputs
+    tokenized_full_texts['input_ids'] = input_ids
+    tokenized_full_texts['attention_mask'] = attention_mask
     tokenized_full_texts['labels'] = labels
     # Keep the prompts and completions
-    tokenized_full_texts['prompt'] = inputs
-    tokenized_full_texts['completion'] = outputs
+    tokenized_full_texts['prompt'] = prompts
+    tokenized_full_texts['completion'] = completions
 
     return tokenized_full_texts
 
@@ -217,7 +222,6 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     extracted_outputs = []
 
     model.eval()
-    # Note: model.device_map='auto' already handles device placement
 
     # Generation parameters
     generation_kwargs = {
@@ -297,6 +301,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     print(f"Saved evaluation details to '{output_jsonl}'")
 
     return result, generated_completions, reference_completions, prompts
+
 # --------------------------
 # Function to generate and print sample summaries
 # --------------------------
@@ -374,7 +379,7 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            #quantization_config=bnb_config,
+            # quantization_config=bnb_config,
             trust_remote_code=False
         )
 
@@ -436,7 +441,7 @@ def main():
     eval_dataset = split_dataset['test']
 
     # --------------------------
-    # Dump prompt and answer pairs to JSONL files
+    # Dump prompt and completion pairs to JSONL files
     # --------------------------
     dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
     dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
@@ -461,20 +466,20 @@ def main():
     tokenized_train_dataset = train_dataset.map(
         lambda examples: preprocess_function(examples, tokenizer),
         batched=True,
-        # Do not remove 'prompt' and 'completion' columns
+        remove_columns=train_dataset.column_names  # Remove original columns
     )
 
     tokenized_eval_dataset = eval_dataset.map(
         lambda examples: preprocess_function(examples, tokenizer),
         batched=True,
-        # Do not remove 'prompt' and 'completion' columns
+        remove_columns=eval_dataset.column_names  # Remove original columns
     )
 
     # --------------------------
-    # Set format for PyTorch tensors
+    # Set format for PyTorch tensors, include prompt and completion
     # --------------------------
-    tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
+    tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
 
     # --------------------------
     # Check if a saved model exists and load it if not retraining
@@ -496,17 +501,6 @@ def main():
         model = PeftModel.from_pretrained(model, save_directory)
         model.eval()
         model.config.use_cache = True
-
-        # Load the tokenizer from the base model
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
-            padding_side='left'
-        )
-
-        # Set the pad_token to eos_token if not already set
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
 
     else:
         logger.info("No saved model found or retraining requested. Proceeding with training.")
@@ -555,33 +549,33 @@ def main():
         print_trainable_parameters(model)
 
         # --------------------------
-        # Define training arguments based on reference code
+        # Define training arguments
         # --------------------------
         training_args = TrainingArguments(
             output_dir='./fine_tuned_model',
-            per_device_train_batch_size=1,          # Adjusted batch size
-            per_device_eval_batch_size=1,           # Adjusted eval batch size
-            gradient_accumulation_steps=4,          # Adjusted gradient accumulation
-            num_train_epochs=100,                     # Adjusted epochs
-            learning_rate=2e-5,                     # Learning rate
-            weight_decay=0.01,                      # Weight decay
-            logging_dir='./logs',                   # Local logging dir
-            logging_steps=50,                       # Logging steps
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=4,
+            num_train_epochs=10,  # Adjust epochs as needed
+            learning_rate=2e-5,
+            weight_decay=0.01,
+            logging_dir='./logs',
+            logging_steps=50,
             save_strategy="steps",
-            save_steps=500,                         # Save steps
-            save_total_limit=3,                     # Total limit
+            save_steps=500,
+            save_total_limit=3,
             evaluation_strategy="steps",
-            eval_steps=500,                         # Eval steps
+            eval_steps=500,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
-            fp16=True,                              # Enable mixed precision
-            optim="adamw_torch",                    # Optimizer
+            fp16=True,
+            optim="adamw_torch",
             lr_scheduler_type="cosine_with_restarts",
-            warmup_ratio=0.1,                       # Warmup ratio
-            max_grad_norm=1.0,                      # Max grad norm
-            gradient_checkpointing=True,            # Gradient checkpointing
+            warmup_ratio=0.1,
+            max_grad_norm=1.0,
+            gradient_checkpointing=True,
             torch_compile=False,
-            report_to="none",                       # Disabled reporting
+            report_to="none",
         )
 
         # --------------------------
@@ -640,8 +634,6 @@ def main():
         # --------------------------
         os.makedirs(save_directory, exist_ok=True)
         model.save_pretrained(save_directory)
-        # Optionally save the tokenizer (but not necessary if it hasn't changed)
-        # tokenizer.save_pretrained(save_directory)
         print(f"Model saved to '{save_directory}'")
 
     # --------------------------
@@ -678,7 +670,7 @@ def main():
 
         # Optional: Generate and Print Sample Summaries
         generate_sample_summaries(
-            eval_dataset=eval_dataset,  # Use the original eval_dataset
+            eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
             tokenizer=tokenizer,
             model=model,
             device='cuda',    # Change to 'cpu' if GPU is not available
