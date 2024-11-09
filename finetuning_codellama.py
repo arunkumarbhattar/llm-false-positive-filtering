@@ -186,6 +186,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         prompts (list): List of prompts used for generation.
     """
     # Set random seed for reproducibility if provided
+
     if seed is not None:
         random.seed(seed)
         torch.manual_seed(seed)
@@ -219,6 +220,9 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 
     # Create a subset of the evaluation dataset
     eval_subset = Subset(eval_dataset, sampled_indices)
+
+    print("Columns in eval_dataset:", eval_dataset.column_names)
+    print("Columns in eval_subset:", eval_subset.dataset.column_names)  # eval_subset is a Subset
 
     # Create DataLoader for the subset
     eval_dataloader = DataLoader(eval_subset, batch_size=batch_size)
@@ -291,8 +295,11 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             generated_completions.extend(processed_completions)
             reference_completions.extend([comp for comp in batch['completion']])
             prompts.extend(prompts_batch)
+            print("Prompts batch:", prompts_batch)
+            print("Reference completions batch:", batch['completion'])
 
-            # Dump the current batch's details to the JSONL file
+
+        # Dump the current batch's details to the JSONL file
             with open(output_jsonl, 'a') as f:
                 for i in range(len(prompts_batch)):
                     f.write(json.dumps({
@@ -315,47 +322,6 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     print(f"ROUGE scores: {result}")
 
     return result, generated_completions, reference_completions, prompts
-# --------------------------
-# Function to generate and print sample summaries
-# --------------------------
-def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num_samples=5):
-    """
-    Generates and prints sample summaries from the evaluation dataset.
-    """
-    print("\nSample Generated Summaries:")
-    model.eval()
-    for i in range(num_samples):
-        sample = eval_dataset[i]
-        prompt = sample['prompt']
-        # Tokenize the prompt
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096, padding='max_length').to(model.device)
-
-        # Generate completion
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
-                max_new_tokens=128,  # Adjust as needed
-                num_beams=1,         # Adjust as needed
-                early_stopping=True,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id  # Ensure pad_token_id is set
-            )
-        # Exclude the prompt tokens from the outputs
-        generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
-        completion = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-
-        # Reference completion
-        reference_completion = sample['completion']
-
-        print(f"\nSample {i+1}:")
-        print("Prompt:")
-        print(prompt)
-        print("Generated Completion:")
-        print(completion)
-        print("Reference Completion:")
-        print(reference_completion)
-
 # --------------------------
 # Function to save evaluation summaries to a JSONL file
 # --------------------------
@@ -440,12 +406,24 @@ def main():
         # --------------------------
         # Load and Tokenize the Evaluation Dataset
         # --------------------------
+        # Optional: Print original columns
+        print("Original columns in eval_dataset:", eval_dataset.column_names)
+
+        # Specify columns to remove, excluding 'prompt' and 'completion'
+        columns_to_remove = []  # Add other columns if present
+
         tokenized_eval_dataset = eval_dataset.map(
             lambda examples: preprocess_function(examples, tokenizer),
             batched=True,
-            remove_columns=eval_dataset.column_names  # Remove original columns
+            remove_columns=columns_to_remove  # Do not remove 'prompt' and 'completion'
         )
+
+        # Set format for PyTorch tensors, include prompt and completion
         tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
+
+        # Print columns after tokenization
+        print("Columns in tokenized_eval_dataset after tokenization:")
+        print(tokenized_eval_dataset.column_names)
 
         # --------------------------
         # Perform Evaluation
@@ -454,7 +432,7 @@ def main():
         evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,
-            eval_dataset=tokenized_eval_dataset,  # Ensure you're passing the tokenized evaluation dataset
+            eval_dataset=tokenized_eval_dataset,
             device='cuda',
             batch_size=1,
             max_new_tokens=40,
@@ -476,15 +454,6 @@ def main():
             print(reference_completions[i])
             print("Generated Completion:")
             print(generated_completions[i])
-
-        # Optional: Generate and Print Sample Summaries
-        generate_sample_summaries(
-            eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
-            tokenizer=tokenizer,
-            model=model,
-            device='cuda',    # Change to 'cpu' if GPU is not available
-            num_samples=num_samples
-        )
 
         # Save evaluation summaries to a JSONL file
         save_evaluation_summaries(
@@ -798,15 +767,6 @@ def main():
                 print(reference_completions[i])
                 print("Generated Completion:")
                 print(generated_completions[i])
-
-            # Optional: Generate and Print Sample Summaries
-            generate_sample_summaries(
-                eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
-                tokenizer=tokenizer,
-                model=model,
-                device='cuda',    # Change to 'cpu' if GPU is not available
-                num_samples=5
-            )
 
             # Save evaluation summaries to a JSONL file
             save_evaluation_summaries(
