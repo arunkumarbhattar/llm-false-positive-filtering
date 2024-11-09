@@ -128,7 +128,7 @@ def preprocess_function(examples, tokenizer):
     targets = examples['completion']
 
     # Tokenize the prompts
-    model_inputs = tokenizer(inputs, max_length=1024, truncation=True, padding='max_length')
+    model_inputs = tokenizer(inputs, max_length=4096, truncation=True, padding='max_length')
 
     # Tokenize the completions as labels
     with tokenizer.as_target_tokenizer():
@@ -154,9 +154,9 @@ def custom_collate_fn(batch):
         dict: A dictionary with batched tensors and lists of strings.
     """
     # Stack tensor fields
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    labels = torch.stack([item['labels'] for item in batch])
+    input_ids = torch.stack([item['input_ids'] for item in batch]).to('cuda')  # Adjust device as needed
+    attention_mask = torch.stack([item['attention_mask'] for item in batch]).to('cuda')
+    labels = torch.stack([item['labels'] for item in batch]).to('cuda')
 
     # Collect string fields into lists
     prompts = [item['prompt'] for item in batch]
@@ -169,6 +169,7 @@ def custom_collate_fn(batch):
         'prompt': prompts,
         'completion': completions
     }
+
 
 # --------------------------
 # Function to evaluate the model
@@ -420,20 +421,22 @@ def main():
         # --------------------------
         # Load and Tokenize the Evaluation Dataset
         # --------------------------
-        # Optional: Print original columns
         print("Original columns in eval_dataset:", eval_dataset.column_names)
+
+        # Remove only non-essential columns if any; here, retain 'prompt' and 'completion'
+        columns_to_remove = [col for col in eval_dataset.column_names if col not in ['prompt', 'completion']]
 
         tokenized_eval_dataset = eval_dataset.map(
             lambda examples: preprocess_function(examples, tokenizer),
             batched=True,
-            # Remove only non-essential columns if any
-            remove_columns=[col for col in eval_dataset.column_names if col not in ['prompt', 'completion']]
+            remove_columns=columns_to_remove  # Remove only unnecessary columns
         )
 
-        # Set format for PyTorch tensors, excluding 'prompt' and 'completion'
+        # Set format for PyTorch tensors, include 'prompt' and 'completion'
         tokenized_eval_dataset.set_format(
             type='torch',
-            columns=['input_ids', 'attention_mask', 'labels']
+            columns=['input_ids', 'attention_mask', 'labels'],
+            output_all_columns=True  # Retain 'prompt' and 'completion'
         )
 
         print("Columns in tokenized_eval_dataset after tokenization:")
