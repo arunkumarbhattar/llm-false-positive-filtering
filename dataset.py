@@ -315,31 +315,3 @@ class Dataset:
 
     def get_function_arguments(self, filename, lineno, func_name):
         pass
-
-
-if __name__ == '__main__':
-    #repo_path = "/home/mjshen/IVOS/repos/juliet-test-suite-for-c-cplusplus-v1-3"
-    #sarif_path = os.path.join(repo_path, "cpp-labeled-202408221915.sarif")
-    repo_path = "/home/mjshen/IVOS/repos/aws-iot-device-sdk-embedded-C/"
-    sarif_path = "/home/mjshen/IVOS/OSSEmbeddedResults/aws/aws-iot-device-sdk-embedded-C/d8c63c0df2bd2252727ec626f4971f61b147add5/cpp.sarif"
-    new_sarif_path = "/home/mjshen/IVOS/OSSEmbeddedResults/aws/aws-iot-device-sdk-embedded-C/d8c63c0df2bd2252727ec626f4971f61b147add5/cpp-labeled.sarif"
-    ds = Dataset(repo_path, sarif_path)
-
-    #codeql_tp = 0
-    #codeql_fp = 0
-    #codeql_unrelated = 0
-    #for uri, lineno, msg, func, gt in ds.get_codeql_results_and_gt():
-    #    if gt == GroundTruth.GOOD:
-    #        codeql_fp += 1
-    #        #print(func)
-    #    elif gt == GroundTruth.BAD:
-    #        codeql_tp += 1
-    #        if codeql_tp % 10 == 0:
-    #            print(uri)
-    #            print(func)
-    #    else:
-    #        codeql_unrelated += 1
-    #print("codeql #tp, #fp, #unrelated:", codeql_tp, codeql_fp, codeql_unrelated)
-    #print(ds.get_function_definition("globalReturnsTrue"))
-
-    ds.manually_label_codeql_results(new_sarif_path)
