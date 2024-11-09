@@ -51,10 +51,10 @@ bnb_config = BitsAndBytesConfig(
 # --------------------------
 # Define save directory
 # --------------------------
-save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql'
+save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql_w_reasoning'
 
 # --------------------------
-def load_training_jsonl(file_path):
+def load_jsonl_with_reasoning(file_path):
     """
     Loads instruction, input, output, and reasoning from a JSONL file.
     Combines 'instruction' and 'input' to create 'prompt', and appends 'reasoning' to 'completion'.
@@ -78,9 +78,9 @@ def load_training_jsonl(file_path):
                 prompt = instruction.strip() + '\n' + input_text.strip()
                 prompts.append(prompt)
 
-                # Append 'reasoning' to 'output' if available
+                # Append 'reasoning' to 'output', with reasoning coming first
                 if reasoning:
-                    completion = f"{output.strip()}\n\n**Reasoning**: {reasoning.strip()}"
+                    completion = f"{reasoning.strip()}\n\n**Tool Selection**: {output.strip()}"
                 else:
                     completion = output.strip()
                 completions.append(completion)
@@ -88,24 +88,6 @@ def load_training_jsonl(file_path):
                 logger.error(f"JSON decoding failed at line {idx+1}: {e}")
                 prompts.append('')
                 completions.append('')
-    return {'prompt': prompts, 'completion': completions}
-
-# --------------------------
-# Function to load evaluation data from JSONL file
-# --------------------------
-def load_eval_jsonl(file_path):
-    """
-    Loads 'prompt' and 'completion' pairs from a JSONL file.
-    """
-    prompts = []
-    completions = []
-    with open(file_path, 'r') as f:
-        for line in f:
-            entry = json.loads(line)
-            prompt = entry.get('prompt', '')
-            completion = entry.get('completion', '')
-            prompts.append(prompt.strip())
-            completions.append(completion.strip())
     return {'prompt': prompts, 'completion': completions}
 
 # --------------------------
@@ -220,11 +202,12 @@ def custom_collate_fn(batch):
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=80, seed=None):
+def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=20, seed=None):
     """
     Generates completions for a randomly sampled subset of the evaluation dataset,
-    extracts unique tool names, compares them against expected tools, computes evaluation metrics,
-    and dumps evaluation details into a JSONL file.
+    extracts unique tool names from the **Tool Selection** section, compares them against expected tools,
+    computes evaluation metrics (Precision, Recall, F1 Score) based on tool matching,
+    and computes ROUGE scores on the full generated outputs including reasoning.
 
     Args:
         model: The language model to be evaluated.
@@ -338,7 +321,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # --------------------------
     # Define the output JSONL file
     # --------------------------
-    output_jsonl = 'evaluation_details.jsonl'
+    output_jsonl = 'evaluation_details_with_reasoning.jsonl'
 
     # --------------------------
     # Remove existing JSONL file if it exists to avoid appending to old data
@@ -395,18 +378,23 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             processed_completions = []
             predicted_tool_sets = []
             for pred in decoded_preds:
-                # Find all tool matches in the prediction
-                tools_found = tool_pattern.findall(pred)
-                # Get unique tools while preserving order
+                # Extract the tool selection part after '**Tool Selection**:'
+                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', pred, re.DOTALL)
+                if tool_selection_match:
+                    tool_selection = tool_selection_match.group(1)
+                else:
+                    tool_selection = ''
+
+                # Extract tool names using regex
+                tools_found = tool_pattern.findall(tool_selection)
                 unique_tools = list(dict.fromkeys(tools_found))
-                # Extract function names without the 'functions.' prefix
                 extracted_tools = [tool for tool in unique_tools]
                 predicted_tool_sets.append(set(extracted_tools))
                 # Join with commas for logging or other purposes
                 if unique_tools:
                     processed_completion = ', '.join(unique_tools)
                 else:
-                    processed_completion = ""
+                    processed_completion = ''
                 processed_completions.append(processed_completion)
             extracted_outputs.extend(processed_completions)
             generated_completions.extend(processed_completions)
@@ -419,18 +407,12 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             # --------------------------
             expected_tool_sets = []
             for ref in reference_batch:
-                # Extract the tool selection part before the reasoning
-                # Assumes the format: "**Tool Selection**: tools...\n\n**Reasoning**: ..."
-                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
+                # Extract the tool selection part after '**Tool Selection**:'
+                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref, re.DOTALL)
                 if tool_selection_match:
                     tool_selection = tool_selection_match.group(1)
                 else:
-                    # If no reasoning is present, extract everything after '**Tool Selection**:'
-                    tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
-                    if tool_selection_match:
-                        tool_selection = tool_selection_match.group(1)
-                    else:
-                        tool_selection = ''
+                    tool_selection = ''
 
                 # Extract tool names using regex
                 tools_in_ref = tool_pattern.findall(tool_selection)
@@ -475,30 +457,11 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # --------------------------
-    # Compute ROUGE scores on tool selections
+    # Compute ROUGE scores on full completions including reasoning
     # --------------------------
-    # Extract tool selection strings from expected completions
-    reference_tool_selections = []
-    for ref in reference_completions:
-        # Extract the tool selection part before the reasoning
-        tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
-        if tool_selection_match:
-            tool_selection = tool_selection_match.group(1)
-        else:
-            # If no reasoning is present, extract everything after '**Tool Selection**:'
-            tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
-            if tool_selection_match:
-                tool_selection = tool_selection_match.group(1)
-            else:
-                tool_selection = ''
-
-        reference_tool_selections.append(tool_selection)
-
-    # Use the processed_completions which are the extracted_output (comma-separated tools) as predictions
-    predictions_tool_selections = generated_completions
-
-    # Compute ROUGE scores on tool selections
-    rouge_result = rouge.compute(predictions=predictions_tool_selections, references=reference_tool_selections, use_stemmer=True)
+    # Predictions are decoded_preds
+    # References are reference_completions
+    rouge_result = rouge.compute(predictions=decoded_preds, references=reference_completions, use_stemmer=True)
 
     # Scale the ROUGE scores to percentages
     rouge_result = {key: value * 100 for key, value in rouge_result.items()}
@@ -593,7 +556,7 @@ def main():
         # Load the Evaluation Dataset
         # --------------------------
         eval_data_path = 'eval_prompt_completion.jsonl'
-        eval_data = load_eval_jsonl(eval_data_path)
+        eval_data = load_jsonl_with_reasoning(eval_data_path)
         eval_dataset = Dataset.from_dict(eval_data)
 
         # --------------------------
@@ -625,7 +588,7 @@ def main():
         # --------------------------
         # Perform Evaluation
         # --------------------------
-        num_samples = 80
+        num_samples = 20
         evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,
@@ -706,7 +669,7 @@ def main():
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_eval_jsonl('fine_tuning_training_data.jsonl')
+        data = load_jsonl_with_reasoning('fine_tuning_training_data.jsonl')
         dataset = Dataset.from_dict(data)
 
         # --------------------------
@@ -719,8 +682,8 @@ def main():
         # --------------------------
         # Dump prompt and completion pairs to JSONL files
         # --------------------------
-        dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
-        dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
+        dump_prompt_completion(train_dataset, 'train_prompt_completion_with_reasoning.jsonl')
+        dump_prompt_completion(eval_dataset, 'eval_prompt_completion_with_reasoning.jsonl')
 
         # --------------------------
         # Load the tokenizer
@@ -947,10 +910,10 @@ def main():
                 model=model,
                 tokenizer=tokenizer,
                 eval_dataset=tokenized_eval_dataset,
-                device='cuda',
-                batch_size=1,
-                max_new_tokens=128,
-                num_beams=3
+                device='cuda',            # Change to 'cpu' if GPU is not available
+                batch_size=1,             # Adjust batch size as needed
+                max_new_tokens=128,       # Adjust max_new_tokens as needed
+                num_beams=1               # Adjust num_beams as needed
             )
 
             print("\nEvaluation Results (ROUGE scores):")
