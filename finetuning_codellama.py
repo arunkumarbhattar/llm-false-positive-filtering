@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # --------------------------
 # Parse command-line arguments
 # --------------------------
-parser = argparse.ArgumentParser(description="Fine-tune codellama model with optional retraining or interactive mode.")
+parser = argparse.ArgumentParser(description="Fine-tune CodeLlama model with optional retraining or interactive mode.")
 parser.add_argument(
     "--retrain",
     action="store_true",
@@ -53,7 +53,7 @@ args = parser.parse_args()
 cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codellama'
 
 # --------------------------
-# Define quantization configuration using BitsAndBytesConfig for 4-bit QLoRA
+# Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
     load_in_8bit=True,
@@ -140,7 +140,7 @@ def preprocess_function(examples, tokenizer):
     tokenized_prompts = tokenizer(
         prompts,
         truncation=True,
-        max_length=1024,  # Adjust based on your data
+        max_length=4096,  # Adjust based on your data and model's capacity
         padding='max_length'
     )
 
@@ -148,7 +148,7 @@ def preprocess_function(examples, tokenizer):
     tokenized_full_texts = tokenizer(
         full_texts,
         truncation=True,
-        max_length=1024,  # Adjust based on your data
+        max_length=4096,  # Adjust based on your data and model's capacity
         padding='max_length'
     )
 
@@ -202,14 +202,14 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 
     # Define the list of possible tools
     possible_tools = [
-        "get_func_definition",
-        "get_path_constraint",
+        "get_variable_usage_paths",
         "variable_def_finder",
-        "get_function_arguments",
         "get_path_constraints",
+        "get_func_definition",
+        "get_function_arguments",
+        "get_path_constraint",
         "get_buffer_size",
         "get_data_size",
-        "get_variable_usage_paths"
     ]
 
     # Create a regex pattern to match any of the possible tools
@@ -250,7 +250,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             input_ids_list = []
             attention_mask_list = []
             for prompt in prompts_batch:
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512, padding='max_length')
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096, padding='max_length')
                 input_ids_list.append(inputs['input_ids'][0])
                 attention_mask_list.append(inputs['attention_mask'][0])
 
@@ -320,7 +320,7 @@ def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num
         sample = eval_dataset[i]
         prompt = sample['prompt']
         # Tokenize the prompt
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512, padding='max_length').to(model.device)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096, padding='max_length').to(model.device)
 
         # Generate completion
         with torch.no_grad():
@@ -384,8 +384,7 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            # quantization_config=bnb_config,
-            trust_remote_code=False
+            trust_remote_code=True  # Set to True if the model uses custom code
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -414,7 +413,7 @@ def main():
                 print("Please enter a valid prompt or type 'exit' to quit.")
                 continue
             # Tokenize the user input
-            inputs = tokenizer(user_input, return_tensors="pt", truncation=True, max_length=512, padding='max_length').to(model.device)
+            inputs = tokenizer(user_input, return_tensors="pt", truncation=True, max_length=4096, padding='max_length').to(model.device)
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids=inputs['input_ids'],
@@ -499,7 +498,7 @@ def main():
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,
-            trust_remote_code=False
+            trust_remote_code=True  # Set to True if the model uses custom code
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -517,7 +516,7 @@ def main():
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,
-            trust_remote_code=False
+            trust_remote_code=True  # Set to True if the model uses custom code
         )
 
         # Set use_cache to False to avoid incompatibility with gradient checkpointing
@@ -529,19 +528,30 @@ def main():
         # Enable gradient checkpointing
         model.gradient_checkpointing_enable()
 
-        # Prepare the model for k-bit (4-bit) training
+        # Prepare the model for k-bit (8-bit) training
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
-        # Apply LoRA configurations
+        # --------------------------
+        # Inspect and Identify Target Modules
+        # --------------------------
+        def get_target_modules(model, patterns=["self_attn", "mlp"]):
+            target = []
+            for name, module in model.named_modules():
+                for pattern in patterns:
+                    if pattern in name:
+                        target.append(name)
+            return target
+
+        identified_targets = get_target_modules(model)
+        logger.info(f"Identified Target Modules for LoRA: {identified_targets}")
+
+        # --------------------------
+        # Apply LoRA configurations with identified target modules
+        # --------------------------
         peft_config = LoraConfig(
             r=16,
             lora_alpha=32,
-            target_modules=[
-                "query_key_value",
-                "dense",
-                "dense_h_to_4h",
-                "dense_4h_to_h",
-            ],
+            target_modules=identified_targets,
             lora_dropout=0.1,
             bias="none",
             task_type=TaskType.CAUSAL_LM
@@ -561,22 +571,23 @@ def main():
             per_device_train_batch_size=1,              # Keep batch size small due to potential GPU memory constraints
             per_device_eval_batch_size=1,               # Same as training batch size
             gradient_accumulation_steps=8,              # Increase to simulate a larger effective batch size
-            num_train_epochs=7,                        # Significantly increase epochs to allow extensive training
+            num_train_epochs=7,                          # Reduced from 200 to 7 epochs
             learning_rate=1e-5,                          # Lower learning rate for finer weight updates
             weight_decay=0.0,                            # Remove weight decay to reduce regularization
             logging_dir='./logs',                        # Directory for logging
             logging_steps=10,                            # Increase logging frequency for better monitoring
             save_strategy="steps",                       # Save checkpoints based on steps
             save_steps=100,                              # Save every 100 steps to capture more checkpoints
-            save_total_limit=None,                       # Allow unlimited checkpoints to prevent overwriting
-            evaluation_strategy="steps",                    # Disable evaluation to focus solely on training accuracy
-            load_best_model_at_end=True,                # Do not load the best model based on evaluation (since eval is disabled)
-            # metric_for_best_model="eval_loss",         # Not needed as evaluation is disabled
+            save_total_limit=10,                         # Limit to the last 10 checkpoints to save storage
+            evaluation_strategy="steps",                 # Enable evaluation
+            eval_steps=100,                              # Evaluate every 100 steps
+            load_best_model_at_end=True,                 # Load the best model based on evaluation metric
+            metric_for_best_model="loss",                # Monitor loss for selecting the best model
             fp16=True,                                   # Use mixed precision for faster training
             optim="adamw_torch",                         # Use AdamW optimizer
             lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
             warmup_steps=100,                            # Minimal warmup steps to stabilize training start
-            max_grad_norm=0.0,                            # Disable gradient clipping to allow larger gradient updates
+            max_grad_norm=1.0,                           # Enable gradient clipping
             gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
             torch_compile=False,                         # Disable Torch compilation for compatibility
             report_to="none",                            # Disable reporting to external systems
