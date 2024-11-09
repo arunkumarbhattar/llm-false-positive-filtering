@@ -204,7 +204,12 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     possible_tools = [
         "get_func_definition",
         "get_path_constraint",
-        "variable_def_finder"
+        "variable_def_finder",
+        "get_function_arguments",
+        "get_path_constraints",
+        "get_buffer_size",
+        "get_data_size",
+        "get_variable_usage_paths"
     ]
 
     # Create a regex pattern to match any of the possible tools
@@ -556,7 +561,7 @@ def main():
             per_device_train_batch_size=1,              # Keep batch size small due to potential GPU memory constraints
             per_device_eval_batch_size=1,               # Same as training batch size
             gradient_accumulation_steps=8,              # Increase to simulate a larger effective batch size
-            num_train_epochs=200,                        # Significantly increase epochs to allow extensive training
+            num_train_epochs=30,                        # Significantly increase epochs to allow extensive training
             learning_rate=1e-5,                          # Lower learning rate for finer weight updates
             weight_decay=0.0,                            # Remove weight decay to reduce regularization
             logging_dir='./logs',                        # Directory for logging
