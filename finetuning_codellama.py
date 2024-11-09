@@ -54,24 +54,58 @@ bnb_config = BitsAndBytesConfig(
 save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql'
 
 # --------------------------
-# Function to load data from JSONL file
-# --------------------------
-def load_jsonl(file_path):
+def load_training_jsonl(file_path):
     """
-    Loads instruction, input, and output pairs from a JSONL file.
-    Combines 'instruction' and 'input' to create 'prompt', and uses 'output' as 'completion'.
+    Loads instruction, input, output, and reasoning from a JSONL file.
+    Combines 'instruction' and 'input' to create 'prompt', and appends 'reasoning' to 'completion'.
+
+    Assumptions:
+    - Each JSON line contains 'instruction', 'input', 'output', and optionally 'reasoning'.
+    - If 'reasoning' is not present, only 'output' is used as 'completion'.
+    """
+    prompts = []
+    completions = []
+    with open(file_path, 'r') as f:
+        for idx, line in enumerate(f):
+            try:
+                entry = json.loads(line)
+                instruction = entry.get('instruction', '')
+                input_text = entry.get('input', '')
+                output = entry.get('output', '')
+                reasoning = entry.get('reasoning', '')  # Optional field
+
+                # Combine 'instruction' and 'input' to form the 'prompt'
+                prompt = instruction.strip() + '\n' + input_text.strip()
+                prompts.append(prompt)
+
+                # Append 'reasoning' to 'output' if available
+                if reasoning:
+                    completion = f"{output.strip()}\n\n**Reasoning**: {reasoning.strip()}"
+                else:
+                    completion = output.strip()
+                completions.append(completion)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decoding failed at line {idx+1}: {e}")
+                prompts.append('')
+                completions.append('')
+    return {'prompt': prompts, 'completion': completions}
+
+# --------------------------
+# Function to load evaluation data from JSONL file
+# --------------------------
+def load_eval_jsonl(file_path):
+    """
+    Loads 'prompt' and 'completion' pairs from a JSONL file.
     """
     prompts = []
     completions = []
     with open(file_path, 'r') as f:
         for line in f:
             entry = json.loads(line)
-            instruction = entry.get('instruction', '')
-            input_text = entry.get('input', '')
-            output = entry.get('output', '')
-            prompt = instruction.strip() + '\n' + input_text.strip()
-            prompts.append(prompt)
-            completions.append(output)
+            prompt = entry.get('prompt', '')
+            completion = entry.get('completion', '')
+            prompts.append(prompt.strip())
+            completions.append(completion.strip())
     return {'prompt': prompts, 'completion': completions}
 
 # --------------------------
@@ -128,11 +162,21 @@ def preprocess_function(examples, tokenizer):
     targets = examples['completion']
 
     # Tokenize the prompts
-    model_inputs = tokenizer(inputs, max_length=4096, truncation=True, padding='max_length')
+    model_inputs = tokenizer(
+        inputs,
+        max_length=1024,
+        truncation=True,
+        padding='max_length'
+    )
 
     # Tokenize the completions as labels
     with tokenizer.as_target_tokenizer():
-        labels = tokenizer(targets, max_length=128, truncation=True, padding='max_length')
+        labels = tokenizer(
+            targets,
+            max_length=128,
+            truncation=True,
+            padding='max_length'
+        )
 
     model_inputs['labels'] = labels['input_ids']
 
@@ -142,7 +186,9 @@ def preprocess_function(examples, tokenizer):
 
     return model_inputs
 
-
+# --------------------------
+# Custom collate function to handle mixed data types
+# --------------------------
 def custom_collate_fn(batch):
     """
     Custom collate function to handle mixed data types in batches.
@@ -154,9 +200,9 @@ def custom_collate_fn(batch):
         dict: A dictionary with batched tensors and lists of strings.
     """
     # Stack tensor fields
-    input_ids = torch.stack([item['input_ids'] for item in batch]).to('cuda')  # Adjust device as needed
-    attention_mask = torch.stack([item['attention_mask'] for item in batch]).to('cuda')
-    labels = torch.stack([item['labels'] for item in batch]).to('cuda')
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
 
     # Collect string fields into lists
     prompts = [item['prompt'] for item in batch]
@@ -178,26 +224,8 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     """
     Generates completions for a randomly sampled subset of the evaluation dataset,
     extracts unique tool names, computes ROUGE metrics, and dumps evaluation details into a JSONL file.
-
-    Args:
-        model: The language model to evaluate.
-        tokenizer: The tokenizer associated with the model.
-        eval_dataset: The evaluation dataset.
-        device (str): The device to run the model on ('cuda' or 'cpu').
-        batch_size (int): Number of samples per batch.
-        max_new_tokens (int): Maximum number of new tokens to generate.
-        num_beams (int): Number of beams for beam search.
-        num_samples (int): Number of random samples to evaluate.
-        seed (int, optional): Random seed for reproducibility.
-
-    Returns:
-        result (dict): ROUGE scores.
-        generated_completions (list): List of extracted tool names from generated outputs.
-        reference_completions (list): List of expected tool names.
-        prompts (list): List of prompts used for generation.
     """
     # Set random seed for reproducibility if provided
-
     if seed is not None:
         random.seed(seed)
         torch.manual_seed(seed)
@@ -218,7 +246,6 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     ]
 
     # Create a regex pattern to match any of the possible tools
-    # The pattern ensures full word matching using word boundaries
     tool_pattern = re.compile(r'\b(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
 
     # Determine the number of samples to evaluate
@@ -254,11 +281,11 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 
     # Generation parameters
     generation_kwargs = {
-        "max_new_tokens": max_new_tokens,  # Number of new tokens to generate
+        "max_new_tokens": max_new_tokens,
         "num_beams": num_beams,
-        "early_stopping": num_beams > 1,  # Only apply early stopping if num_beams > 1
+        "early_stopping": num_beams > 1,
         "do_sample": False,
-        "pad_token_id": tokenizer.eos_token_id  # Ensure pad_token_id is set
+        "pad_token_id": tokenizer.eos_token_id
     }
 
     # Define the output JSONL file
@@ -274,15 +301,10 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     with torch.no_grad():
         for batch in tqdm(eval_dataloader, desc="Generating completions"):
             prompts_batch = batch['prompt']
-            input_ids_list = []
-            attention_mask_list = []
-            for prompt in prompts_batch:
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096, padding='max_length')
-                input_ids_list.append(inputs['input_ids'][0])
-                attention_mask_list.append(inputs['attention_mask'][0])
+            reference_batch = batch['completion']
 
-            input_ids = torch.stack(input_ids_list).to(device)
-            attention_mask = torch.stack(attention_mask_list).to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
 
             # Generate completions
             outputs = model.generate(
@@ -304,24 +326,25 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
                 if unique_tools:
                     processed_completion = ', '.join(unique_tools)
                 else:
-                    processed_completion = ""  # Assign empty string if no tools found
+                    processed_completion = ""
                 processed_completions.append(processed_completion)
             extracted_outputs.extend(processed_completions)
             generated_completions.extend(processed_completions)
-            reference_completions.extend([comp for comp in batch['completion']])
+            reference_completions.extend(reference_batch)
             prompts.extend(prompts_batch)
+
+            # Debug print statements after tokenization
             print("Prompts batch:", prompts_batch)
-            print("Reference completions batch:", batch['completion'])
+            print("Reference completions batch:", reference_batch)
 
-
-        # Dump the current batch's details to the JSONL file
+            # Dump the current batch's details to the JSONL file
             with open(output_jsonl, 'a') as f:
                 for i in range(len(prompts_batch)):
                     f.write(json.dumps({
                         'prompt': prompts_batch[i],
                         'model_output': decoded_preds[i],
                         'extracted_output': processed_completions[i],
-                        'expected_output': batch['completion'][i]
+                        'expected_output': reference_batch[i]
                     }) + '\n')
 
     # Compute ROUGE scores
@@ -337,6 +360,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     print(f"ROUGE scores: {result}")
 
     return result, generated_completions, reference_completions, prompts
+
 # --------------------------
 # Function to save evaluation summaries to a JSONL file
 # --------------------------
@@ -372,9 +396,6 @@ def parse_arguments():
 # --------------------------
 
 def main():
-    # --------------------------
-    # Handle Interactive Mode
-    # --------------------------
     args = parse_arguments()
 
     if args.only_eval:
@@ -391,16 +412,16 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
-            trust_remote_code=True              # Ensure custom code is handled
+            quantization_config=bnb_config,
+            trust_remote_code=True
         )
 
-        # Load the LoRA adapters using PeftModel.from_pretrained
+        # Load the LoRA adapters
         model = PeftModel.from_pretrained(model, save_directory)
         model.eval()
         model.config.use_cache = True
 
-        # Load the tokenizer from the base model
+        # Load the tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             "Phind/Phind-CodeLlama-34B-v2",
             cache_dir=cache_dir,
@@ -415,21 +436,19 @@ def main():
         # Load the Evaluation Dataset
         # --------------------------
         eval_data_path = 'eval_prompt_completion.jsonl'
-        eval_data = load_jsonl(eval_data_path)
+        eval_data = load_eval_jsonl(eval_data_path)
         eval_dataset = Dataset.from_dict(eval_data)
 
         # --------------------------
-        # Load and Tokenize the Evaluation Dataset
+        # Tokenize the Evaluation Dataset
         # --------------------------
         print("Original columns in eval_dataset:", eval_dataset.column_names)
-
-        # Remove only non-essential columns if any; here, retain 'prompt' and 'completion'
-        columns_to_remove = [col for col in eval_dataset.column_names if col not in ['prompt', 'completion']]
 
         tokenized_eval_dataset = eval_dataset.map(
             lambda examples: preprocess_function(examples, tokenizer),
             batched=True,
-            remove_columns=columns_to_remove  # Remove only unnecessary columns
+            remove_columns=[],  # Do not remove columns
+            load_from_cache_file=False  # Ensure changes take effect
         )
 
         # Set format for PyTorch tensors, include 'prompt' and 'completion'
@@ -457,16 +476,16 @@ def main():
             device='cuda',
             batch_size=1,
             max_new_tokens=40,
-            num_beams=3,           # Set to >1 to utilize beam search
-            num_samples=num_samples,        # Number of random samples to evaluate
-            seed=42                # For reproducibility
+            num_beams=3,
+            num_samples=num_samples,
+            seed=42
         )
         print("\nEvaluation Results (ROUGE scores):")
         print(evaluation_results)
 
         # Show ground truth and generated outputs
         print("\nGround Truth vs Generated Completions:")
-        num_samples_to_show = 5
+        num_samples_to_show = min(5, num_samples)
         for i in range(num_samples_to_show):
             print(f"\nSample {i+1}:")
             print("Prompt:")
@@ -551,7 +570,7 @@ def main():
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_jsonl('fine_tuning_training_data.jsonl')
+        data = load_eval_jsonl('fine_tuning_training_data.jsonl')
         dataset = Dataset.from_dict(data)
 
         # --------------------------
@@ -574,7 +593,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             cache_dir=cache_dir,
-            padding_side='left'  # Ensure padding side is left
+            padding_side='left'
         )
 
         # Set the pad_token to eos_token if not already set
@@ -587,14 +606,38 @@ def main():
         tokenized_train_dataset = train_dataset.map(
             lambda examples: preprocess_function(examples, tokenizer),
             batched=True,
-            remove_columns=train_dataset.column_names  # Remove original columns
+            remove_columns=[],  # Do not remove columns
+            load_from_cache_file=False  # Ensure changes take effect
         )
 
         tokenized_eval_dataset = eval_dataset.map(
             lambda examples: preprocess_function(examples, tokenizer),
             batched=True,
-            remove_columns=eval_dataset.column_names  # Remove original columns
+            remove_columns=[],  # Do not remove columns
+            load_from_cache_file=False  # Ensure changes take effect
         )
+
+        # Set format for PyTorch tensors
+        tokenized_train_dataset.set_format(
+            type='torch',
+            columns=['input_ids', 'attention_mask', 'labels'],
+            output_all_columns=True
+        )
+        tokenized_eval_dataset.set_format(
+            type='torch',
+            columns=['input_ids', 'attention_mask', 'labels'],
+            output_all_columns=True
+        )
+
+        # --------------------------
+        # Print sample entries after tokenization
+        # --------------------------
+        print("Sample from tokenized_train_dataset:")
+        print(tokenized_train_dataset[0])
+
+        print("Sample from tokenized_eval_dataset:")
+        print(tokenized_eval_dataset[0])
+
 
         # --------------------------
         # Set format for PyTorch tensors, include prompt and completion
