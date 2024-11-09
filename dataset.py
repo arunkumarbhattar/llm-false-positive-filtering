@@ -60,6 +60,39 @@ class Dataset:
                     codeql_results.append((uri, startLine, msg, func, mygt))
         return codeql_results
 
+    def get_codeql_results_and_gt_all_facts(self):
+        with open(self.sarif_path, 'r') as f:
+            s = json.load(f)
+
+        codeql_results = []
+        for run in s.get('runs', []):
+            rules_metadata = run['tool']['driver']['rules']
+            for r in run.get('results', []):
+                # TODO: The ruleId field is optional and potentially ambiguous. We might have to fetch the actual
+                # ruleId from the rule metadata via the ruleIndex field.
+                # (see https://github.com/microsoft/sarif-tutorials/blob/main/docs/2-Basics.md#rule-metadata)
+                ruleId = r['ruleId']
+                ruleIndex = r['ruleIndex']
+                #if uri is None or match_path_and_rule(uri, ruleId, args.patterns):
+                rule_level = rules_metadata[ruleIndex]['defaultConfiguration']['level']
+                if rule_level not in ['error', 'warning']:
+                    continue
+                gt = r['groundTruth']
+                if gt != 'TP' and gt != 'FP':
+                    continue
+                msg = r['message']['text']
+
+                for l in r.get('locations', []):
+                    # TODO: The uri field is optional. We might have to fetch the actual uri from "artifacts" via "index"
+                    # (see https://github.com/microsoft/sarif-tutorials/blob/main/docs/2-Basics.md#-linking-results-to-artifacts)
+                    uri = l.get('physicalLocation', {}).get('artifactLocation', {}).get('uri', None)
+                    startLine = l.get('physicalLocation', {}).get('region', {}).get('startLine', None)
+                    func_name, func_startline, func_endline = self.get_function_loc(uri, startLine)
+                    func = self.dump_src(uri, func_startline, func_endline, True)
+                    mygt = GroundTruth.BAD if gt == 'TP' else GroundTruth.GOOD
+                    codeql_results.append((uri, startLine, msg, func, mygt, ruleId))
+        return codeql_results
+
     def manually_label_codeql_results(self, new_sarif_path, rule="cpp/uninitialized-local"):
         with open(self.sarif_path, 'r') as f:
             s = json.load(f)
@@ -267,6 +300,21 @@ class Dataset:
             return f"Command failed with error: {e.stderr}"
         except Exception as e:
             return f"An unexpected error occurred: {e}"
+
+    def get_variable_usage_paths(self, filename, varname):
+        pass
+
+    def get_data_size(self, filename, lineno, varname):
+        pass
+
+    def get_buffer_size(self, filename, lineno, varname):
+        pass
+
+    def get_path_constraints(self, filename, lineno):
+        pass
+
+    def get_function_arguments(self, filename, lineno, func_name):
+        pass
 
 
 if __name__ == '__main__':
