@@ -1,7 +1,9 @@
 import json
 import os
+import random
 import re
 import torch
+from torch.utils.data import DataLoader, Subset
 import argparse
 from transformers import (
     AutoTokenizer,
@@ -177,10 +179,10 @@ def preprocess_function(examples, tokenizer):
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1):
+def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=20, seed=None):
     """
-    Generates completions for the evaluation dataset, extracts unique tool names,
-    computes ROUGE metrics, and dumps evaluation details into a JSONL file.
+    Generates completions for a randomly sampled subset of the evaluation dataset,
+    extracts unique tool names, computes ROUGE metrics, and dumps evaluation details into a JSONL file.
 
     Args:
         model: The language model to evaluate.
@@ -190,6 +192,8 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         batch_size (int): Number of samples per batch.
         max_new_tokens (int): Maximum number of new tokens to generate.
         num_beams (int): Number of beams for beam search.
+        num_samples (int): Number of random samples to evaluate.
+        seed (int, optional): Random seed for reproducibility.
 
     Returns:
         result (dict): ROUGE scores.
@@ -197,6 +201,11 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         reference_completions (list): List of expected tool names.
         prompts (list): List of prompts used for generation.
     """
+    # Set random seed for reproducibility if provided
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
+
     # Load ROUGE metric
     rouge = evaluate.load("rouge")
 
@@ -216,8 +225,19 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # The pattern ensures full word matching using word boundaries
     tool_pattern = re.compile(r'\b(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
 
-    # Create DataLoader for evaluation
-    eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size)
+    # Determine the number of samples to evaluate
+    total_samples = len(eval_dataset)
+    if num_samples > total_samples:
+        raise ValueError(f"num_samples ({num_samples}) cannot be greater than the size of eval_dataset ({total_samples}).")
+
+    # Randomly sample indices
+    sampled_indices = random.sample(range(total_samples), num_samples)
+
+    # Create a subset of the evaluation dataset
+    eval_subset = Subset(eval_dataset, sampled_indices)
+
+    # Create DataLoader for the subset
+    eval_dataloader = DataLoader(eval_subset, batch_size=batch_size)
 
     # Initialize lists to store results
     generated_completions = []
@@ -226,13 +246,14 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     model_outputs = []
     extracted_outputs = []
 
+    model.to(device)
     model.eval()
 
     # Generation parameters
     generation_kwargs = {
         "max_new_tokens": max_new_tokens,  # Number of new tokens to generate
         "num_beams": num_beams,
-        "early_stopping": True,
+        "early_stopping": num_beams > 1,  # Only apply early stopping if num_beams > 1
         "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id  # Ensure pad_token_id is set
     }
@@ -244,6 +265,9 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     if os.path.exists(output_jsonl):
         os.remove(output_jsonl)
 
+    # Log the start of evaluation
+    print("INFO:__main__:Starting evaluation on a subset of the dataset...")
+
     with torch.no_grad():
         for batch in tqdm(eval_dataloader, desc="Generating completions"):
             prompts_batch = batch['prompt']
@@ -254,8 +278,8 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
                 input_ids_list.append(inputs['input_ids'][0])
                 attention_mask_list.append(inputs['attention_mask'][0])
 
-            input_ids = torch.stack(input_ids_list).to(model.device)
-            attention_mask = torch.stack(attention_mask_list).to(model.device)
+            input_ids = torch.stack(input_ids_list).to(device)
+            attention_mask = torch.stack(attention_mask_list).to(device)
 
             # Generate completions
             outputs = model.generate(
@@ -281,7 +305,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
                 processed_completions.append(processed_completion)
             extracted_outputs.extend(processed_completions)
             generated_completions.extend(processed_completions)
-            reference_completions.extend(batch['completion'])
+            reference_completions.extend([comp for comp in batch['completion']])
             prompts.extend(prompts_batch)
 
             # Dump the current batch's details to the JSONL file
@@ -304,9 +328,9 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     result = {k: round(v, 4) for k, v in result.items()}
 
     print(f"Saved evaluation details to '{output_jsonl}'")
+    print(f"ROUGE scores: {result}")
 
     return result, generated_completions, reference_completions, prompts
-
 # --------------------------
 # Function to generate and print sample summaries
 # --------------------------
@@ -364,6 +388,17 @@ def save_evaluation_summaries(generated_completions, reference_completions, prom
             }) + '\n')
     print(f"Saved {min(num_samples, len(generated_completions))} summaries to {filename}")
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Fine-tune and evaluate CodeLlama with LoRA adapters.")
+
+    # Existing arguments
+    parser.add_argument('--interactive', action='store_true', help='Enter interactive chat mode after loading the model.')
+    parser.add_argument('--retrain', action='store_true', help='Retrain the model even if a saved model exists.')
+    parser.add_argument('--only_eval', action='store_true', help='Perform only evaluation without training.')
+    parser.add_argument('--train', action='store_true', help='Perform training.')
+    # Parse the arguments
+    args = parser.parse_args()
+    return args
 # --------------------------
 # Main Execution Flow
 # --------------------------
@@ -372,6 +407,109 @@ def main():
     # --------------------------
     # Handle Interactive Mode
     # --------------------------
+    args = parse_arguments()
+
+    if args.only_eval:
+        logger.info("Only evaluation mode activated. Skipping training and interactive modes.")
+
+        # Ensure that a saved model exists
+        if not os.path.exists(save_directory):
+            logger.error(f"Save directory '{save_directory}' does not exist. Cannot perform evaluation.")
+            exit(1)
+
+        # Load the base model
+        model = AutoModelForCausalLM.from_pretrained(
+            "Phind/Phind-CodeLlama-34B-v2",
+            cache_dir=cache_dir,
+            device_map='auto',
+            torch_dtype=torch.float16,
+            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+            trust_remote_code=True              # Ensure custom code is handled
+        )
+
+        # Load the LoRA adapters using PeftModel.from_pretrained
+        model = PeftModel.from_pretrained(model, save_directory)
+        model.eval()
+        model.config.use_cache = True
+
+        # Load the tokenizer from the base model
+        tokenizer = AutoTokenizer.from_pretrained(
+            "Phind/Phind-CodeLlama-34B-v2",
+            cache_dir=cache_dir,
+            padding_side='left'
+        )
+
+        # Set the pad_token to eos_token if not already set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # --------------------------
+        # Load the Evaluation Dataset
+        # --------------------------
+        eval_data_path = 'eval_prompt_completion.jsonl'
+        eval_data = load_jsonl(eval_data_path)
+        eval_dataset = Dataset.from_dict(eval_data)
+
+        # --------------------------
+        # Load and Tokenize the Evaluation Dataset
+        # --------------------------
+        tokenized_eval_dataset = eval_dataset.map(
+            lambda examples: preprocess_function(examples, tokenizer),
+            batched=True,
+            remove_columns=eval_dataset.column_names  # Remove original columns
+        )
+        tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
+
+        # --------------------------
+        # Perform Evaluation
+        # --------------------------
+        num_samples = 20
+        evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
+            model=model,
+            tokenizer=tokenizer,
+            eval_dataset=tokenized_eval_dataset,  # Ensure you're passing the tokenized evaluation dataset
+            device='cuda',
+            batch_size=1,
+            max_new_tokens=40,
+            num_beams=3,           # Set to >1 to utilize beam search
+            num_samples=num_samples,        # Number of random samples to evaluate
+            seed=42                # For reproducibility
+        )
+        print("\nEvaluation Results (ROUGE scores):")
+        print(evaluation_results)
+
+        # Show ground truth and generated outputs
+        print("\nGround Truth vs Generated Completions:")
+        num_samples_to_show = 5
+        for i in range(num_samples_to_show):
+            print(f"\nSample {i+1}:")
+            print("Prompt:")
+            print(prompts[i])
+            print("Ground Truth Completion:")
+            print(reference_completions[i])
+            print("Generated Completion:")
+            print(generated_completions[i])
+
+        # Optional: Generate and Print Sample Summaries
+        generate_sample_summaries(
+            eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
+            tokenizer=tokenizer,
+            model=model,
+            device='cuda',    # Change to 'cpu' if GPU is not available
+            num_samples=num_samples
+        )
+
+        # Save evaluation summaries to a JSONL file
+        save_evaluation_summaries(
+            generated_completions=generated_completions,
+            reference_completions=reference_completions,
+            prompts=prompts,
+            filename='evaluation_summaries.jsonl',
+            num_samples=num_samples
+        )
+
+        exit(0)  # Exit after evaluation
+
     if args.interactive:
         if not os.path.exists(save_directory):
             logger.error(f"Save directory '{save_directory}' does not exist. Cannot enter interactive mode.")
@@ -432,264 +570,265 @@ def main():
             print(f"Model: {response}")
         exit(0)  # Exit the script after the chat session
 
-    # --------------------------
-    # Load your training data
-    # --------------------------
-    data = load_jsonl('fine_tuning_training_data.jsonl')
-    dataset = Dataset.from_dict(data)
+    if args.train:
+        # --------------------------
+        # Load your training data
+        # --------------------------
+        data = load_jsonl('fine_tuning_training_data.jsonl')
+        dataset = Dataset.from_dict(data)
 
-    # --------------------------
-    # Split the dataset into training and evaluation sets
-    # --------------------------
-    split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
-    train_dataset = split_dataset['train']
-    eval_dataset = split_dataset['test']
+        # --------------------------
+        # Split the dataset into training and evaluation sets
+        # --------------------------
+        split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
+        train_dataset = split_dataset['train']
+        eval_dataset = split_dataset['test']
 
-    # --------------------------
-    # Dump prompt and completion pairs to JSONL files
-    # --------------------------
-    dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
-    dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
+        # --------------------------
+        # Dump prompt and completion pairs to JSONL files
+        # --------------------------
+        dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
+        dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
 
-    # --------------------------
-    # Load the tokenizer
-    # --------------------------
-    model_id = 'Phind/Phind-CodeLlama-34B-v2'
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        cache_dir=cache_dir,
-        padding_side='left'  # Ensure padding side is left
-    )
-
-    # Set the pad_token to eos_token if not already set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # --------------------------
-    # Apply the preprocessing
-    # --------------------------
-    tokenized_train_dataset = train_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=train_dataset.column_names  # Remove original columns
-    )
-
-    tokenized_eval_dataset = eval_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=eval_dataset.column_names  # Remove original columns
-    )
-
-    # --------------------------
-    # Set format for PyTorch tensors, include prompt and completion
-    # --------------------------
-    tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
-    tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
-
-    # --------------------------
-    # Check if a saved model exists and load it if not retraining
-    # --------------------------
-    if os.path.exists(save_directory) and not args.retrain:
-        logger.info(f"Found a saved model in '{save_directory}'. Loading the model and skipping training.")
-
-        # Load the base model
-        model = AutoModelForCausalLM.from_pretrained(
+        # --------------------------
+        # Load the tokenizer
+        # --------------------------
+        model_id = 'Phind/Phind-CodeLlama-34B-v2'
+        tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             cache_dir=cache_dir,
-            device_map='auto',
-            torch_dtype=torch.float16,
-            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
-            trust_remote_code=True              # Ensure custom code is handled
+            padding_side='left'  # Ensure padding side is left
         )
 
-        # Load the LoRA adapters using PeftModel.from_pretrained
-        model = PeftModel.from_pretrained(model, save_directory)
-        model.eval()
-        model.config.use_cache = True
+        # Set the pad_token to eos_token if not already set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    else:
-        logger.info("No saved model found or retraining requested. Proceeding with training.")
-
-        # Load the base model with quantization_config
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
-            device_map='auto',
-            torch_dtype=torch.float16,
-            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
-            trust_remote_code=True              # Ensure custom code is handled
+        # --------------------------
+        # Apply the preprocessing
+        # --------------------------
+        tokenized_train_dataset = train_dataset.map(
+            lambda examples: preprocess_function(examples, tokenizer),
+            batched=True,
+            remove_columns=train_dataset.column_names  # Remove original columns
         )
 
-        # Set use_cache to False to avoid incompatibility with gradient checkpointing
-        model.config.use_cache = False
-
-        # Enable gradient checkpointing
-        model.gradient_checkpointing_enable()
-
-        # Prepare the model for k-bit (8-bit) training
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-
-        # --------------------------
-        # Define the target module names
-        # --------------------------
-        target_module_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
-
-        # --------------------------
-        # Apply LoRA configurations with correct target modules
-        # --------------------------
-        peft_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=target_module_names,  # Use only supported module names
-            lora_dropout=0.1,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM
-        )
-
-        # Apply PEFT model
-        model = get_peft_model(model, peft_config)
-
-        # Verify trainable parameters
-        print_trainable_parameters(model)
-
-        # --------------------------
-        # Define training arguments
-        # --------------------------
-        training_args = TrainingArguments(
-            output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
-            per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
-            per_device_eval_batch_size=3,
-            dataloader_num_workers = 8, # Same as training batch size
-            gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
-            num_train_epochs=5,                          # Adjusted number of epochs
-            learning_rate=1e-5,                          # Lower learning rate for finer weight updates
-            weight_decay=0.0,                            # Remove weight decay to reduce regularization
-            logging_dir='./logs',                        # Directory for logging
-            logging_steps=100,                            # Increase logging frequency for better monitoring
-            save_strategy="steps",                       # Save checkpoints based on steps
-            save_steps=500,                              # Save every 100 steps to capture more checkpoints
-            save_total_limit=10,                         # Limit to the last 10 checkpoints to save storage
-            evaluation_strategy="steps",                 # Enable evaluation
-            eval_steps=500,                              # Evaluate every 100 steps
-            load_best_model_at_end=True,                 # Load the best model based on evaluation metric
-            metric_for_best_model="loss",                # Monitor loss for selecting the best model
-            fp16=True,                                   # Use mixed precision for faster training
-            optim="adamw_hf",                         # Use AdamW optimizer
-            lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
-            warmup_steps=100,                            # Minimal warmup steps to stabilize training start
-            max_grad_norm=1.0,                           # Enable gradient clipping
-            gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
-            torch_compile=False,                         # Disable Torch compilation for compatibility
-            report_to="none",                            # Disable reporting to external systems
+        tokenized_eval_dataset = eval_dataset.map(
+            lambda examples: preprocess_function(examples, tokenizer),
+            batched=True,
+            remove_columns=eval_dataset.column_names  # Remove original columns
         )
 
         # --------------------------
-        # Define custom callback for detecting abnormal loss
+        # Set format for PyTorch tensors, include prompt and completion
         # --------------------------
-        class CustomCallback(TrainerCallback):
-            def on_step_end(self, args, state, control, **kwargs):
-                # Ensure that log_history is non-empty before accessing the last element
-                if not state.log_history:
-                    logger.warning(f"At step {state.global_step}: 'log_history' is empty.")
-                    return  # Exit early since there's nothing to process
-
-                # Access the last entry in log_history
-                last_log = state.log_history[-1]
-
-                # Check if 'loss' is present in the last log entry
-                if 'loss' in last_log:
-                    loss = last_log['loss']
-                    logger.debug(f"At step {state.global_step}: loss = {loss}")
-
-                    # Detect abnormal loss values
-                    if loss > 1e4 or loss < 0:
-                        logger.error(f"Abnormal loss detected at step {state.global_step}: {loss}")
-                        control.should_terminate_training = True
-                else:
-                    logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
+        tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
+        tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
 
         # --------------------------
-        # Data collator for language modeling
+        # Check if a saved model exists and load it if not retraining
         # --------------------------
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=tokenizer,
-            mlm=False  # Not using masked language modeling
-        )
+        if os.path.exists(save_directory) and not args.retrain:
+            logger.info(f"Found a saved model in '{save_directory}'. Loading the model and skipping training.")
+
+            # Load the base model
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                device_map='auto',
+                torch_dtype=torch.float16,
+                quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+                trust_remote_code=True              # Ensure custom code is handled
+            )
+
+            # Load the LoRA adapters using PeftModel.from_pretrained
+            model = PeftModel.from_pretrained(model, save_directory)
+            model.eval()
+            model.config.use_cache = True
+
+        else:
+            logger.info("No saved model found or retraining requested. Proceeding with training.")
+
+            # Load the base model with quantization_config
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                device_map='auto',
+                torch_dtype=torch.float16,
+                quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+                trust_remote_code=True              # Ensure custom code is handled
+            )
+
+            # Set use_cache to False to avoid incompatibility with gradient checkpointing
+            model.config.use_cache = False
+
+            # Enable gradient checkpointing
+            model.gradient_checkpointing_enable()
+
+            # Prepare the model for k-bit (8-bit) training
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+            # --------------------------
+            # Define the target module names
+            # --------------------------
+            target_module_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+
+            # --------------------------
+            # Apply LoRA configurations with correct target modules
+            # --------------------------
+            peft_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=target_module_names,  # Use only supported module names
+                lora_dropout=0.1,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM
+            )
+
+            # Apply PEFT model
+            model = get_peft_model(model, peft_config)
+
+            # Verify trainable parameters
+            print_trainable_parameters(model)
+
+            # --------------------------
+            # Define training arguments
+            # --------------------------
+            training_args = TrainingArguments(
+                output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
+                per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
+                per_device_eval_batch_size=3,
+                dataloader_num_workers = 8, # Same as training batch size
+                gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
+                num_train_epochs=5,                          # Adjusted number of epochs
+                learning_rate=1e-5,                          # Lower learning rate for finer weight updates
+                weight_decay=0.0,                            # Remove weight decay to reduce regularization
+                logging_dir='./logs',                        # Directory for logging
+                logging_steps=100,                            # Increase logging frequency for better monitoring
+                save_strategy="steps",                       # Save checkpoints based on steps
+                save_steps=500,                              # Save every 100 steps to capture more checkpoints
+                save_total_limit=10,                         # Limit to the last 10 checkpoints to save storage
+                evaluation_strategy="steps",                 # Enable evaluation
+                eval_steps=500,                              # Evaluate every 100 steps
+                load_best_model_at_end=True,                 # Load the best model based on evaluation metric
+                metric_for_best_model="loss",                # Monitor loss for selecting the best model
+                fp16=True,                                   # Use mixed precision for faster training
+                optim="adamw_hf",                         # Use AdamW optimizer
+                lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
+                warmup_steps=100,                            # Minimal warmup steps to stabilize training start
+                max_grad_norm=1.0,                           # Enable gradient clipping
+                gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
+                torch_compile=False,                         # Disable Torch compilation for compatibility
+                report_to="none",                            # Disable reporting to external systems
+            )
+
+            # --------------------------
+            # Define custom callback for detecting abnormal loss
+            # --------------------------
+            class CustomCallback(TrainerCallback):
+                def on_step_end(self, args, state, control, **kwargs):
+                    # Ensure that log_history is non-empty before accessing the last element
+                    if not state.log_history:
+                        logger.warning(f"At step {state.global_step}: 'log_history' is empty.")
+                        return  # Exit early since there's nothing to process
+
+                    # Access the last entry in log_history
+                    last_log = state.log_history[-1]
+
+                    # Check if 'loss' is present in the last log entry
+                    if 'loss' in last_log:
+                        loss = last_log['loss']
+                        logger.debug(f"At step {state.global_step}: loss = {loss}")
+
+                        # Detect abnormal loss values
+                        if loss > 1e4 or loss < 0:
+                            logger.error(f"Abnormal loss detected at step {state.global_step}: {loss}")
+                            control.should_terminate_training = True
+                    else:
+                        logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
+
+            # --------------------------
+            # Data collator for language modeling
+            # --------------------------
+            data_collator = DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                mlm=False  # Not using masked language modeling
+            )
+
+            # --------------------------
+            # Initialize the Trainer
+            # --------------------------
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_train_dataset,
+                eval_dataset=tokenized_eval_dataset,
+                data_collator=data_collator,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
+                tokenizer=tokenizer,  # This ensures the tokenizer is saved with the model
+            )
+
+            # --------------------------
+            # Start training
+            # --------------------------
+            trainer.train()
+
+            # --------------------------
+            # Save the LoRA adapters
+            # --------------------------
+            os.makedirs(save_directory, exist_ok=True)
+            model.save_pretrained(save_directory)
+            print(f"Model saved to '{save_directory}'")
 
         # --------------------------
-        # Initialize the Trainer
+        # Proceed with Evaluation (Only if Not in Interactive Mode)
         # --------------------------
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=tokenized_train_dataset,
-            eval_dataset=tokenized_eval_dataset,
-            data_collator=data_collator,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
-            tokenizer=tokenizer,  # This ensures the tokenizer is saved with the model
-        )
+        if not args.interactive:
+            logger.info("Starting evaluation...")
 
-        # --------------------------
-        # Start training
-        # --------------------------
-        trainer.train()
+            # Perform Evaluation with Generation and Compute ROUGE Metrics
+            evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
+                model=model,
+                tokenizer=tokenizer,
+                eval_dataset=tokenized_eval_dataset,
+                device='cuda',            # Change to 'cpu' if GPU is not available
+                batch_size=1,             # Adjust batch size as needed
+                max_new_tokens=128,       # Adjust max_new_tokens as needed
+                num_beams=1               # Adjust num_beams as needed
+            )
 
-        # --------------------------
-        # Save the LoRA adapters
-        # --------------------------
-        os.makedirs(save_directory, exist_ok=True)
-        model.save_pretrained(save_directory)
-        print(f"Model saved to '{save_directory}'")
+            print("\nEvaluation Results (ROUGE scores):")
+            print(evaluation_results)
 
-    # --------------------------
-    # Proceed with Evaluation (Only if Not in Interactive Mode)
-    # --------------------------
-    if not args.interactive:
-        logger.info("Starting evaluation...")
+            # Show ground truth and generated outputs
+            print("\nGround Truth vs Generated Completions:")
+            num_samples_to_show = 5
+            for i in range(num_samples_to_show):
+                print(f"\nSample {i+1}:")
+                print("Prompt:")
+                print(prompts[i])
+                print("Ground Truth Completion:")
+                print(reference_completions[i])
+                print("Generated Completion:")
+                print(generated_completions[i])
 
-        # Perform Evaluation with Generation and Compute ROUGE Metrics
-        evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
-            model=model,
-            tokenizer=tokenizer,
-            eval_dataset=tokenized_eval_dataset,
-            device='cuda',            # Change to 'cpu' if GPU is not available
-            batch_size=1,             # Adjust batch size as needed
-            max_new_tokens=128,       # Adjust max_new_tokens as needed
-            num_beams=1               # Adjust num_beams as needed
-        )
+            # Optional: Generate and Print Sample Summaries
+            generate_sample_summaries(
+                eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
+                tokenizer=tokenizer,
+                model=model,
+                device='cuda',    # Change to 'cpu' if GPU is not available
+                num_samples=5
+            )
 
-        print("\nEvaluation Results (ROUGE scores):")
-        print(evaluation_results)
-
-        # Show ground truth and generated outputs
-        print("\nGround Truth vs Generated Completions:")
-        num_samples_to_show = 5
-        for i in range(num_samples_to_show):
-            print(f"\nSample {i+1}:")
-            print("Prompt:")
-            print(prompts[i])
-            print("Ground Truth Completion:")
-            print(reference_completions[i])
-            print("Generated Completion:")
-            print(generated_completions[i])
-
-        # Optional: Generate and Print Sample Summaries
-        generate_sample_summaries(
-            eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
-            tokenizer=tokenizer,
-            model=model,
-            device='cuda',    # Change to 'cpu' if GPU is not available
-            num_samples=5
-        )
-
-        # Save evaluation summaries to a JSONL file
-        save_evaluation_summaries(
-            generated_completions=generated_completions,
-            reference_completions=reference_completions,
-            prompts=prompts,
-            filename='evaluation_summaries.jsonl',
-            num_samples=100
-        )
+            # Save evaluation summaries to a JSONL file
+            save_evaluation_summaries(
+                generated_completions=generated_completions,
+                reference_completions=reference_completions,
+                prompts=prompts,
+                filename='evaluation_summaries.jsonl',
+                num_samples=100
+            )
 
 if __name__ == "__main__":
     main()
