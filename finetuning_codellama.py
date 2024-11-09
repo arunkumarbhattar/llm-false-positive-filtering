@@ -115,50 +115,60 @@ def print_trainable_parameters(model):
 # --------------------------
 def preprocess_function(examples, tokenizer):
     """
-    Tokenizes the input prompts and completions.
-    Masks the prompt part in the labels to ignore them during loss computation.
+    Preprocesses the input examples by tokenizing the prompts and completions.
+
+    Args:
+        examples (dict): A batch of examples containing 'prompt' and 'completion'.
+        tokenizer: The tokenizer associated with the model.
+
+    Returns:
+        dict: A dictionary containing tokenized inputs and labels, along with the original 'prompt' and 'completion'.
     """
-    prompts = examples['prompt']
-    completions = examples['completion']
-    full_texts = [prompt + '\n' + completion for prompt, completion in zip(prompts, completions)]
+    inputs = examples['prompt']
+    targets = examples['completion']
 
-    # Tokenize prompts
-    tokenized_prompts = tokenizer(
-        prompts,
-        truncation=True,
-        max_length=1024,  # Adjust based on your data and model's capacity
-        padding='max_length'
-    )
+    # Tokenize the prompts
+    model_inputs = tokenizer(inputs, max_length=1024, truncation=True, padding='max_length')
 
-    # Tokenize full texts
-    tokenized_full_texts = tokenizer(
-        full_texts,
-        truncation=True,
-        max_length=1024,  # Adjust based on your data and model's capacity
-        padding='max_length'
-    )
+    # Tokenize the completions as labels
+    with tokenizer.as_target_tokenizer():
+        labels = tokenizer(targets, max_length=128, truncation=True, padding='max_length')
 
-    input_ids = tokenized_full_texts['input_ids']
-    attention_mask = tokenized_full_texts['attention_mask']
-    labels = []
+    model_inputs['labels'] = labels['input_ids']
 
-    for i in range(len(input_ids)):
-        # Calculate the actual length of the prompt (excluding padding)
-        prompt_len = sum(token != tokenizer.pad_token_id for token in tokenized_prompts['input_ids'][i])
-        label = input_ids[i].copy()
-        # Mask the prompt part in the labels
-        label[:prompt_len] = [-100] * prompt_len
-        labels.append(label)
+    # Explicitly preserve 'prompt' and 'completion' fields
+    model_inputs['prompt'] = examples['prompt']
+    model_inputs['completion'] = examples['completion']
 
-    # Prepare the final tokenized inputs
-    tokenized_full_texts['input_ids'] = input_ids
-    tokenized_full_texts['attention_mask'] = attention_mask
-    tokenized_full_texts['labels'] = labels
-    # Keep the prompts and completions
-    tokenized_full_texts['prompt'] = prompts
-    tokenized_full_texts['completion'] = completions
+    return model_inputs
 
-    return tokenized_full_texts
+
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle mixed data types in batches.
+
+    Args:
+        batch (list): A list of dictionaries from the dataset.
+
+    Returns:
+        dict: A dictionary with batched tensors and lists of strings.
+    """
+    # Stack tensor fields
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+
+    # Collect string fields into lists
+    prompts = [item['prompt'] for item in batch]
+    completions = [item['completion'] for item in batch]
+
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels,
+        'prompt': prompts,
+        'completion': completions
+    }
 
 # --------------------------
 # Function to evaluate the model
@@ -225,7 +235,11 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     print("Columns in eval_subset:", eval_subset.dataset.column_names)  # eval_subset is a Subset
 
     # Create DataLoader for the subset
-    eval_dataloader = DataLoader(eval_subset, batch_size=batch_size)
+    eval_dataloader = DataLoader(
+        eval_subset,
+        batch_size=batch_size,
+        collate_fn=custom_collate_fn
+    )
 
     # Initialize lists to store results
     generated_completions = []
@@ -409,21 +423,25 @@ def main():
         # Optional: Print original columns
         print("Original columns in eval_dataset:", eval_dataset.column_names)
 
-        # Specify columns to remove, excluding 'prompt' and 'completion'
-        columns_to_remove = []  # Add other columns if present
-
         tokenized_eval_dataset = eval_dataset.map(
             lambda examples: preprocess_function(examples, tokenizer),
             batched=True,
-            remove_columns=columns_to_remove  # Do not remove 'prompt' and 'completion'
+            # Remove only non-essential columns if any
+            remove_columns=[col for col in eval_dataset.column_names if col not in ['prompt', 'completion']]
         )
 
-        # Set format for PyTorch tensors, include prompt and completion
-        tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
+        # Set format for PyTorch tensors, excluding 'prompt' and 'completion'
+        tokenized_eval_dataset.set_format(
+            type='torch',
+            columns=['input_ids', 'attention_mask', 'labels']
+        )
 
-        # Print columns after tokenization
         print("Columns in tokenized_eval_dataset after tokenization:")
         print(tokenized_eval_dataset.column_names)
+
+        # Optional: Print a sample to verify
+        print("Sample entry from tokenized_eval_dataset:")
+        print(tokenized_eval_dataset[0])
 
         # --------------------------
         # Perform Evaluation
