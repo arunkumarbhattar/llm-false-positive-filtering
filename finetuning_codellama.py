@@ -384,9 +384,8 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            load_in_8bit=True,  # Use 8-bit quantization
-            quantization_config=bnb_config,
-            trust_remote_code=True  # Ensure custom code is handled
+            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+            trust_remote_code=True              # Ensure custom code is handled
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -499,9 +498,8 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            load_in_8bit=True,  # Use 8-bit quantization
-            quantization_config=bnb_config,
-            trust_remote_code=True  # Ensure custom code is handled
+            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+            trust_remote_code=True              # Ensure custom code is handled
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -518,9 +516,8 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            load_in_8bit=True,  # Use 8-bit quantization
-            quantization_config=bnb_config,
-            trust_remote_code=True  # Ensure custom code is handled
+            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+            trust_remote_code=True              # Ensure custom code is handled
         )
 
         # Set use_cache to False to avoid incompatibility with gradient checkpointing
