@@ -34,22 +34,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------
-# Parse command-line arguments
-# --------------------------
-parser = argparse.ArgumentParser(description="Fine-tune CodeLlama model with optional retraining or interactive mode.")
-parser.add_argument(
-    "--retrain",
-    action="store_true",
-    help="If set, retrain the model even if a saved model exists."
-)
-parser.add_argument(
-    "--interactive",
-    action="store_true",
-    help="If set, load the trained model and start an interactive chat session."
-)
-args = parser.parse_args()
-
-# --------------------------
 # Specify the cache directory
 # --------------------------
 cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codellama'
@@ -388,6 +372,9 @@ def save_evaluation_summaries(generated_completions, reference_completions, prom
             }) + '\n')
     print(f"Saved {min(num_samples, len(generated_completions))} summaries to {filename}")
 
+# --------------------------
+# Parse command-line arguments
+# --------------------------
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Fine-tune and evaluate CodeLlama with LoRA adapters.")
 
