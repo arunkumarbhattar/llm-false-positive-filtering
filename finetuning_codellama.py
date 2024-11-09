@@ -140,7 +140,7 @@ def preprocess_function(examples, tokenizer):
     tokenized_prompts = tokenizer(
         prompts,
         truncation=True,
-        max_length=4096,  # Adjust based on your data and model's capacity
+        max_length=1024,  # Adjust based on your data and model's capacity
         padding='max_length'
     )
 
@@ -148,7 +148,7 @@ def preprocess_function(examples, tokenizer):
     tokenized_full_texts = tokenizer(
         full_texts,
         truncation=True,
-        max_length=4096,  # Adjust based on your data and model's capacity
+        max_length=1024,  # Adjust based on your data and model's capacity
         padding='max_length'
     )
 
@@ -560,21 +560,21 @@ def main():
             per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
             per_device_eval_batch_size=3,
             dataloader_num_workers = 8, # Same as training batch size
-            gradient_accumulation_steps=8,               # Increase to simulate a larger effective batch size
-            num_train_epochs=7,                          # Adjusted number of epochs
+            gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
+            num_train_epochs=5,                          # Adjusted number of epochs
             learning_rate=1e-5,                          # Lower learning rate for finer weight updates
             weight_decay=0.0,                            # Remove weight decay to reduce regularization
             logging_dir='./logs',                        # Directory for logging
-            logging_steps=10,                            # Increase logging frequency for better monitoring
+            logging_steps=100,                            # Increase logging frequency for better monitoring
             save_strategy="steps",                       # Save checkpoints based on steps
-            save_steps=100,                              # Save every 100 steps to capture more checkpoints
+            save_steps=500,                              # Save every 100 steps to capture more checkpoints
             save_total_limit=10,                         # Limit to the last 10 checkpoints to save storage
             evaluation_strategy="steps",                 # Enable evaluation
-            eval_steps=100,                              # Evaluate every 100 steps
+            eval_steps=500,                              # Evaluate every 100 steps
             load_best_model_at_end=True,                 # Load the best model based on evaluation metric
             metric_for_best_model="loss",                # Monitor loss for selecting the best model
             fp16=True,                                   # Use mixed precision for faster training
-            optim="adamw_torch",                         # Use AdamW optimizer
+            optim="adamw_hf",                         # Use AdamW optimizer
             lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
             warmup_steps=100,                            # Minimal warmup steps to stabilize training start
             max_grad_norm=1.0,                           # Enable gradient clipping
