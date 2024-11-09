@@ -56,10 +56,10 @@ cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codellam
 # Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    bnb_8bit_use_double_quant=True,
-    bnb_8bit_quant_type="nf4",
-    bnb_8bit_compute_dtype=torch.float16
+    load_in_8bit=True,                       # Enable 8-bit quantization
+    bnb_8bit_use_double_quant=True,          # Use double quantization for better accuracy
+    bnb_8bit_quant_type="nf4",               # Quantization type; "nf4" is recommended for transformers
+    bnb_8bit_compute_dtype=torch.float16      # Compute dtype for 8-bit weights
 )
 
 # --------------------------
@@ -202,14 +202,14 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 
     # Define the list of possible tools
     possible_tools = [
-        "get_variable_usage_paths",
-        "variable_def_finder",
-        "get_path_constraints",
         "get_func_definition",
-        "get_function_arguments",
         "get_path_constraint",
+        "variable_def_finder",
+        "get_function_arguments",
+        "get_path_constraints",
         "get_buffer_size",
         "get_data_size",
+        "get_variable_usage_paths"
     ]
 
     # Create a regex pattern to match any of the possible tools
@@ -384,7 +384,9 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            trust_remote_code=True  # Set to True if the model uses custom code
+            load_in_8bit=True,  # Use 8-bit quantization
+            quantization_config=bnb_config,
+            trust_remote_code=True  # Ensure custom code is handled
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -497,8 +499,9 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
+            load_in_8bit=True,  # Use 8-bit quantization
             quantization_config=bnb_config,
-            trust_remote_code=True  # Set to True if the model uses custom code
+            trust_remote_code=True  # Ensure custom code is handled
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -515,15 +518,13 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
+            load_in_8bit=True,  # Use 8-bit quantization
             quantization_config=bnb_config,
-            trust_remote_code=True  # Set to True if the model uses custom code
+            trust_remote_code=True  # Ensure custom code is handled
         )
 
         # Set use_cache to False to avoid incompatibility with gradient checkpointing
         model.config.use_cache = False
-
-        # Set pad_token_id in the model's configuration
-        model.config.pad_token_id = tokenizer.eos_token_id
 
         # Enable gradient checkpointing
         model.gradient_checkpointing_enable()
@@ -532,26 +533,17 @@ def main():
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
         # --------------------------
-        # Inspect and Identify Target Modules
+        # Define the target module names
         # --------------------------
-        def get_target_modules(model, patterns=["self_attn", "mlp"]):
-            target = []
-            for name, module in model.named_modules():
-                for pattern in patterns:
-                    if pattern in name:
-                        target.append(name)
-            return target
-
-        identified_targets = get_target_modules(model)
-        logger.info(f"Identified Target Modules for LoRA: {identified_targets}")
+        target_module_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
 
         # --------------------------
-        # Apply LoRA configurations with identified target modules
+        # Apply LoRA configurations with correct target modules
         # --------------------------
         peft_config = LoraConfig(
             r=16,
             lora_alpha=32,
-            target_modules=identified_targets,
+            target_modules=target_module_names,  # Use only supported module names
             lora_dropout=0.1,
             bias="none",
             task_type=TaskType.CAUSAL_LM
@@ -568,10 +560,10 @@ def main():
         # --------------------------
         training_args = TrainingArguments(
             output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
-            per_device_train_batch_size=1,              # Keep batch size small due to potential GPU memory constraints
-            per_device_eval_batch_size=1,               # Same as training batch size
-            gradient_accumulation_steps=8,              # Increase to simulate a larger effective batch size
-            num_train_epochs=7,                          # Reduced from 200 to 7 epochs
+            per_device_train_batch_size=1,               # Keep batch size small due to potential GPU memory constraints
+            per_device_eval_batch_size=1,                # Same as training batch size
+            gradient_accumulation_steps=8,               # Increase to simulate a larger effective batch size
+            num_train_epochs=7,                          # Adjusted number of epochs
             learning_rate=1e-5,                          # Lower learning rate for finer weight updates
             weight_decay=0.0,                            # Remove weight decay to reduce regularization
             logging_dir='./logs',                        # Directory for logging
