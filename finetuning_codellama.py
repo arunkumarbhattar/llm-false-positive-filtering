@@ -223,17 +223,50 @@ def custom_collate_fn(batch):
 def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=20, seed=None):
     """
     Generates completions for a randomly sampled subset of the evaluation dataset,
-    extracts unique tool names, computes ROUGE metrics, and dumps evaluation details into a JSONL file.
+    extracts unique tool names, compares them against expected tools, computes evaluation metrics,
+    and dumps evaluation details into a JSONL file.
+
+    Args:
+        model: The language model to be evaluated.
+        tokenizer: The tokenizer associated with the model.
+        eval_dataset: The evaluation dataset containing 'prompt' and 'completion' fields.
+        device (str): The device to run the model on ('cuda' or 'cpu').
+        batch_size (int): The batch size for evaluation.
+        max_new_tokens (int): The maximum number of new tokens to generate.
+        num_beams (int): The number of beams for beam search.
+        num_samples (int): The number of samples to evaluate.
+        seed (int, optional): Random seed for reproducibility.
+
+    Returns:
+        dict: A dictionary containing evaluation metrics.
+        list: Generated completions.
+        list: Reference completions.
+        list: Prompts.
     """
+    import json
+    import os
+    import random
+    import re
+    import torch
+    from torch.utils.data import DataLoader, Subset
+    from tqdm import tqdm
+    import evaluate
+
+    # --------------------------
     # Set random seed for reproducibility if provided
+    # --------------------------
     if seed is not None:
         random.seed(seed)
         torch.manual_seed(seed)
 
+    # --------------------------
     # Load ROUGE metric
+    # --------------------------
     rouge = evaluate.load("rouge")
 
-    # Define the list of possible tools
+    # --------------------------
+    # Define the list of possible tools (without 'functions.' prefix)
+    # --------------------------
     possible_tools = [
         "get_func_definition",
         "get_path_constraint",
@@ -245,41 +278,63 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         "get_variable_usage_paths"
     ]
 
-    # Create a regex pattern to match any of the possible tools
-    tool_pattern = re.compile(r'\b(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
+    # --------------------------
+    # Create a regex pattern to match any of the possible tools, possibly preceded by 'functions.'
+    # This pattern captures the tool name without the 'functions.' prefix.
+    # Example matches: 'functions.get_func_definition' or 'get_func_definition'
+    # The tool name is captured in group(1).
+    # --------------------------
+    tool_pattern = re.compile(r'\b(?:functions\.)?(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
 
+    # --------------------------
     # Determine the number of samples to evaluate
+    # --------------------------
     total_samples = len(eval_dataset)
     if num_samples > total_samples:
         raise ValueError(f"num_samples ({num_samples}) cannot be greater than the size of eval_dataset ({total_samples}).")
 
-    # Randomly sample indices
+    # --------------------------
+    # Randomly sample indices for evaluation
+    # --------------------------
     sampled_indices = random.sample(range(total_samples), num_samples)
 
+    # --------------------------
     # Create a subset of the evaluation dataset
+    # --------------------------
     eval_subset = Subset(eval_dataset, sampled_indices)
 
     print("Columns in eval_dataset:", eval_dataset.column_names)
     print("Columns in eval_subset:", eval_subset.dataset.column_names)  # eval_subset is a Subset
 
+    # --------------------------
     # Create DataLoader for the subset
+    # --------------------------
     eval_dataloader = DataLoader(
         eval_subset,
         batch_size=batch_size,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn  # Ensure this function is defined elsewhere in your script
     )
 
+    # --------------------------
     # Initialize lists to store results
+    # --------------------------
     generated_completions = []
     reference_completions = []
     prompts = []
     model_outputs = []
     extracted_outputs = []
+    extracted_expected_tools = []
+    extracted_predicted_tools = []
 
+    # --------------------------
+    # Move model to the specified device and set to evaluation mode
+    # --------------------------
     model.to(device)
     model.eval()
 
-    # Generation parameters
+    # --------------------------
+    # Define generation parameters
+    # --------------------------
     generation_kwargs = {
         "max_new_tokens": max_new_tokens,
         "num_beams": num_beams,
@@ -288,17 +343,42 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         "pad_token_id": tokenizer.eos_token_id
     }
 
+    # --------------------------
     # Define the output JSONL file
+    # --------------------------
     output_jsonl = 'evaluation_details.jsonl'
 
+    # --------------------------
     # Remove existing JSONL file if it exists to avoid appending to old data
+    # --------------------------
     if os.path.exists(output_jsonl):
         os.remove(output_jsonl)
 
+    # --------------------------
     # Log the start of evaluation
+    # --------------------------
     print("INFO:__main__:Starting evaluation on a subset of the dataset...")
 
+    # --------------------------
+    # Initialize counters for set-based metrics
+    # --------------------------
+    total_correct = 0
+    total_predicted = 0
+    total_reference = 0
+
+    # --------------------------
+    # Initialize lists for set-based metrics
+    # --------------------------
+    all_predicted_tool_sets = []
+    all_reference_tool_sets = []
+
+    # --------------------------
+    # Disable gradient computation for evaluation
+    # --------------------------
     with torch.no_grad():
+        # --------------------------
+        # Iterate over batches in the DataLoader
+        # --------------------------
         for batch in tqdm(eval_dataloader, desc="Generating completions"):
             prompts_batch = batch['prompt']
             reference_batch = batch['completion']
@@ -306,7 +386,9 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
 
-            # Generate completions
+            # --------------------------
+            # Generate completions using the model
+            # --------------------------
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -315,14 +397,20 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             model_outputs.extend(decoded_preds)
 
+            # --------------------------
             # Process each generated completion to extract unique tools
+            # --------------------------
             processed_completions = []
+            predicted_tool_sets = []
             for pred in decoded_preds:
                 # Find all tool matches in the prediction
                 tools_found = tool_pattern.findall(pred)
                 # Get unique tools while preserving order
                 unique_tools = list(dict.fromkeys(tools_found))
-                # Join with commas
+                # Extract function names without the 'functions.' prefix
+                extracted_tools = [tool for tool in unique_tools]
+                predicted_tool_sets.append(set(extracted_tools))
+                # Join with commas for logging or other purposes
                 if unique_tools:
                     processed_completion = ', '.join(unique_tools)
                 else:
@@ -332,12 +420,52 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             generated_completions.extend(processed_completions)
             reference_completions.extend(reference_batch)
             prompts.extend(prompts_batch)
+            extracted_predicted_tools.extend(predicted_tool_sets)
 
-            # Debug print statements after tokenization
+            # --------------------------
+            # Extract expected tools from reference_batch by parsing the tool selection
+            # --------------------------
+            expected_tool_sets = []
+            for ref in reference_batch:
+                # Extract the tool selection part before the reasoning
+                # Assumes the format: "**Tool Selection**: tools...\n\n**Reasoning**: ..."
+                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
+                if tool_selection_match:
+                    tool_selection = tool_selection_match.group(1)
+                else:
+                    # If no reasoning is present, extract everything after '**Tool Selection**:'
+                    tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
+                    if tool_selection_match:
+                        tool_selection = tool_selection_match.group(1)
+                    else:
+                        tool_selection = ''
+
+                # Extract tool names using regex
+                tools_in_ref = tool_pattern.findall(tool_selection)
+                extracted_ref_tools = [tool for tool in tools_in_ref]
+                expected_tool_sets.append(set(extracted_ref_tools))
+            extracted_expected_tools.extend(expected_tool_sets)
+
+            # --------------------------
+            # Compute set-based metrics for each sample
+            # --------------------------
+            for pred_set, ref_set in zip(predicted_tool_sets, expected_tool_sets):
+                correct = len(pred_set.intersection(ref_set))
+                total_correct += correct
+                total_predicted += len(pred_set)
+                total_reference += len(ref_set)
+                all_predicted_tool_sets.append(pred_set)
+                all_reference_tool_sets.append(ref_set)
+
+            # --------------------------
+            # Debug print statements after processing
+            # --------------------------
             print("Prompts batch:", prompts_batch)
             print("Reference completions batch:", reference_batch)
 
+            # --------------------------
             # Dump the current batch's details to the JSONL file
+            # --------------------------
             with open(output_jsonl, 'a') as f:
                 for i in range(len(prompts_batch)):
                     f.write(json.dumps({
@@ -347,19 +475,72 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
                         'expected_output': reference_batch[i]
                     }) + '\n')
 
-    # Compute ROUGE scores
-    result = rouge.compute(predictions=generated_completions, references=reference_completions, use_stemmer=True)
+    # --------------------------
+    # Compute set-based metrics: Precision, Recall, F1 Score
+    # --------------------------
+    precision = (total_correct / total_predicted) * 100 if total_predicted > 0 else 0.0
+    recall = (total_correct / total_reference) * 100 if total_reference > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-    # Scale the scores
-    result = {key: value * 100 for key, value in result.items()}
+    # --------------------------
+    # Compute ROUGE scores on tool selections
+    # --------------------------
+    # Extract tool selection strings from expected completions
+    reference_tool_selections = []
+    for ref in reference_completions:
+        # Extract the tool selection part before the reasoning
+        tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
+        if tool_selection_match:
+            tool_selection = tool_selection_match.group(1)
+        else:
+            # If no reasoning is present, extract everything after '**Tool Selection**:'
+            tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
+            if tool_selection_match:
+                tool_selection = tool_selection_match.group(1)
+            else:
+                tool_selection = ''
 
-    # Round the results for readability
-    result = {k: round(v, 4) for k, v in result.items()}
+        reference_tool_selections.append(tool_selection)
 
+    # Use the processed_completions which are the extracted_output (comma-separated tools) as predictions
+    predictions_tool_selections = generated_completions
+
+    # Compute ROUGE scores on tool selections
+    rouge_result = rouge.compute(predictions=predictions_tool_selections, references=reference_tool_selections, use_stemmer=True)
+
+    # Scale the ROUGE scores to percentages
+    rouge_result = {key: value * 100 for key, value in rouge_result.items()}
+
+    # Round the ROUGE scores for readability
+    rouge_result = {k: round(v, 4) for k, v in rouge_result.items()}
+
+    # --------------------------
+    # Compile all evaluation metrics
+    # --------------------------
+    metrics = {
+        'precision': round(precision, 4),
+        'recall': round(recall, 4),
+        'f1': round(f1, 4),
+        'rouge1': round(rouge_result.get('rouge1', 0.0), 4),
+        'rouge2': round(rouge_result.get('rouge2', 0.0), 4),
+        'rougeL': round(rouge_result.get('rougeL', 0.0), 4),
+        'rougeLsum': round(rouge_result.get('rougeLsum', 0.0), 4)
+    }
+
+    # --------------------------
+    # Print and return the evaluation results
+    # --------------------------
     print(f"Saved evaluation details to '{output_jsonl}'")
-    print(f"ROUGE scores: {result}")
+    print(f"Evaluation Metrics:")
+    print(f"Precision: {metrics['precision']}%")
+    print(f"Recall: {metrics['recall']}%")
+    print(f"F1 Score: {metrics['f1']}%")
+    print(f"ROUGE1: {metrics['rouge1']}%")
+    print(f"ROUGE2: {metrics['rouge2']}%")
+    print(f"ROUGE-L: {metrics['rougeL']}%")
+    print(f"ROUGE-Lsum: {metrics['rougeLsum']}%")
 
-    return result, generated_completions, reference_completions, prompts
+    return metrics, generated_completions, reference_completions, prompts
 
 # --------------------------
 # Function to save evaluation summaries to a JSONL file
