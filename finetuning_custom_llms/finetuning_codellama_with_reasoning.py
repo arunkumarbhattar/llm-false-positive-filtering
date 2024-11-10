@@ -26,6 +26,7 @@ import logging
 from tqdm import tqdm
 import evaluate
 from torch.utils.data import DataLoader
+from transformers import EarlyStoppingCallback
 
 # --------------------------
 # Set up logging

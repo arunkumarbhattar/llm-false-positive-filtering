@@ -20,6 +20,8 @@ from peft import (
     TaskType,
     PeftModel
 )
+from transformers import EarlyStoppingCallback
+
 from transformers import TrainerCallback, EarlyStoppingCallback
 import logging
 from tqdm import tqdm
@@ -889,6 +891,7 @@ def main():
                 gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
                 torch_compile=False,                         # Disable Torch compilation for compatibility
                 report_to="none",                            # Disable reporting to external systems
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
             )
 
             # --------------------------
