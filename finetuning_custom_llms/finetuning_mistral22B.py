@@ -865,11 +865,11 @@ def main():
             # --------------------------
             training_args = TrainingArguments(
                 output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
-                per_device_train_batch_size=4,               # Keep batch size small due to potential GPU memory constraints
-                per_device_eval_batch_size=4,
+                per_device_train_batch_size=8,               # Keep batch size small due to potential GPU memory constraints
+                per_device_eval_batch_size=8,
                 dataloader_num_workers=8,                    # Number of data loader workers
                 gradient_accumulation_steps=2,               # Increase to simulate a larger effective batch size
-                num_train_epochs=4,                          # Adjusted number of epochs
+                num_train_epochs=7,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
                 logging_dir='./logs',                        # Directory for logging
