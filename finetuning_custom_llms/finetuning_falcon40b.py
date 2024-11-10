@@ -701,6 +701,7 @@ def main():
         exit(0)  # Exit the script after the chat session
 
     if args.train:
+        print("we have enetered training loop\n")
         # --------------------------
         # Load your training data
         # --------------------------
