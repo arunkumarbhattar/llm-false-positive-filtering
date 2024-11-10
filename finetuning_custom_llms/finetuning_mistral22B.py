@@ -890,8 +890,7 @@ def main():
                 max_grad_norm=1.0,                           # Enable gradient clipping
                 gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
                 torch_compile=False,                         # Disable Torch compilation for compatibility
-                report_to="none",                            # Disable reporting to external systems
-                callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
+                report_to="none"
             )
 
             # --------------------------
