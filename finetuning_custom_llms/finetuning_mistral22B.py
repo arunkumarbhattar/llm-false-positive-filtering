@@ -856,7 +856,7 @@ def main():
                 per_device_eval_batch_size=3,
                 dataloader_num_workers=8,                    # Number of data loader workers
                 gradient_accumulation_steps=2,               # Increase to simulate a larger effective batch size
-                num_train_epochs=4,                          # Adjusted number of epochs
+                num_train_epochs=3,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
                 logging_dir='./logs',                        # Directory for logging
