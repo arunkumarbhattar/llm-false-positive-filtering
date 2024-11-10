@@ -59,8 +59,8 @@ def load_jsonl_with_reasoning(file_path):
     Loads 'prompt' and 'completion' from a JSONL file.
 
     Assumptions:
-    - Each JSON line contains 'prompt' and 'completion'.
-    - 'completion' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
+    - Each JSON line contains 'instruction', 'input', and 'output'.
+    - 'output' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
 
     Args:
         file_path (str): Path to the JSONL file.
@@ -74,10 +74,18 @@ def load_jsonl_with_reasoning(file_path):
         for idx, line in enumerate(f):
             try:
                 entry = json.loads(line)
-                prompt = entry.get('prompt', '').strip()
-                completion = entry.get('completion', '').strip()
+
+                # Extract fields with default empty strings if not present
+                instruction = entry.get('instruction', '').strip()
+                input_text = entry.get('input', '').strip()
+                output = entry.get('output', '').strip()
+
+                # Combine 'instruction' and 'input' to form 'prompt'
+                prompt = f"{instruction}\n{input_text}"
                 prompts.append(prompt)
-                completions.append(completion)
+
+                # Use 'output' as 'completion'
+                completions.append(output)
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decoding failed at line {idx+1}: {e}")
                 prompts.append('')
@@ -372,12 +380,15 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             processed_completions = []
             predicted_tool_sets = []
             for pred in decoded_preds:
-                # Extract the tool selection part after '**Tool Selection**:'
-                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', pred, re.DOTALL)
+                # Adjusted regex to match both '**Tool Selection**:' and 'Tools to invoke:'
+                tool_selection_match = re.search(r'(\*\*Tool Selection\*\*:|Tools to invoke:)\s*(.*)', pred, re.DOTALL | re.IGNORECASE)
                 if tool_selection_match:
-                    tool_selection = tool_selection_match.group(1)
+                    tool_selection = tool_selection_match.group(2)
                 else:
                     tool_selection = ''
+
+                # Extract tool names using regex
+                tools_found = tool_pattern.findall(tool_selection)
 
                 # Extract tool names using regex
                 tools_found = tool_pattern.findall(tool_selection)

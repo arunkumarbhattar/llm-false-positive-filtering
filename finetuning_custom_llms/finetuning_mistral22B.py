@@ -58,8 +58,8 @@ def load_jsonl_with_reasoning(file_path):
     Loads 'prompt' and 'completion' from a JSONL file.
 
     Assumptions:
-    - Each JSON line contains 'prompt' and 'completion'.
-    - 'completion' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
+    - Each JSON line contains 'instruction', 'input', and 'output'.
+    - 'output' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
 
     Args:
         file_path (str): Path to the JSONL file.
@@ -73,10 +73,18 @@ def load_jsonl_with_reasoning(file_path):
         for idx, line in enumerate(f):
             try:
                 entry = json.loads(line)
-                prompt = entry.get('prompt', '').strip()
-                completion = entry.get('completion', '').strip()
+
+                # Extract fields with default empty strings if not present
+                instruction = entry.get('instruction', '').strip()
+                input_text = entry.get('input', '').strip()
+                output = entry.get('output', '').strip()
+
+                # Combine 'instruction' and 'input' to form 'prompt'
+                prompt = f"{instruction}\n{input_text}"
                 prompts.append(prompt)
-                completions.append(completion)
+
+                # Use 'output' as 'completion'
+                completions.append(output)
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decoding failed at line {idx+1}: {e}")
                 prompts.append('')
@@ -857,11 +865,11 @@ def main():
             # --------------------------
             training_args = TrainingArguments(
                 output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
-                per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
-                per_device_eval_batch_size=3,
+                per_device_train_batch_size=4,               # Keep batch size small due to potential GPU memory constraints
+                per_device_eval_batch_size=4,
                 dataloader_num_workers=8,                    # Number of data loader workers
                 gradient_accumulation_steps=2,               # Increase to simulate a larger effective batch size
-                num_train_epochs=3,                          # Adjusted number of epochs
+                num_train_epochs=4,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
                 logging_dir='./logs',                        # Directory for logging
