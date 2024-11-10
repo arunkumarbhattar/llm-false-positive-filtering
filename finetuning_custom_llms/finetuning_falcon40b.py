@@ -699,7 +699,7 @@ def main():
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_training_jsonl('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
+        data = load_jsonl_with_reasoning('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
         dataset = Dataset.from_dict(data)
 
         # --------------------------
@@ -846,8 +846,8 @@ def main():
                 per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
                 per_device_eval_batch_size=3,
                 dataloader_num_workers=8,                    # Number of data loader workers
-                gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
-                num_train_epochs=5,                          # Adjusted number of epochs
+                gradient_accumulation_steps=2,               # Increase to simulate a larger effective batch size
+                num_train_epochs=4,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
                 logging_dir='./logs',                        # Directory for logging
