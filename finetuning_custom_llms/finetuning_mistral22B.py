@@ -3,7 +3,6 @@ import os
 import random
 import re
 import torch
-from torch.utils.data import DataLoader, Subset
 import argparse
 from transformers import (
     AutoTokenizer,
@@ -25,7 +24,7 @@ from transformers import TrainerCallback, EarlyStoppingCallback
 import logging
 from tqdm import tqdm
 import evaluate
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 # --------------------------
 # Set up logging
@@ -36,22 +35,53 @@ logger = logging.getLogger(__name__)
 # --------------------------
 # Specify the cache directory
 # --------------------------
-cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codellama'
+cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/mistral'
 
 # --------------------------
-# Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
+# Define quantization configuration using BitsAndBytesConfig for 4-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,                       # Enable 8-bit quantization
-    bnb_8bit_use_double_quant=True,          # Use double quantization for better accuracy
-    bnb_8bit_quant_type="nf4",               # Quantization type; "nf4" is recommended for transformers
-    bnb_8bit_compute_dtype=torch.float16      # Compute dtype for 8-bit weights
+    load_in_4bit=True,                       # Enable 4-bit quantization
+    bnb_4bit_use_double_quant=True,          # Use double quantization for better accuracy
+    bnb_4bit_quant_type="nf4",               # Quantization type; "nf4" is recommended for transformers
+    bnb_4bit_compute_dtype=torch.float16      # Compute dtype for 4-bit weights
 )
 
 # --------------------------
 # Define save directory
 # --------------------------
-save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql'
+save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_mistral_codeql'
+
+# --------------------------
+def load_jsonl_with_reasoning(file_path):
+    """
+    Loads 'prompt' and 'completion' from a JSONL file.
+
+    Assumptions:
+    - Each JSON line contains 'prompt' and 'completion'.
+    - 'completion' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
+
+    Args:
+        file_path (str): Path to the JSONL file.
+
+    Returns:
+        dict: A dictionary with 'prompt' and 'completion' lists.
+    """
+    prompts = []
+    completions = []
+    with open(file_path, 'r') as f:
+        for idx, line in enumerate(f):
+            try:
+                entry = json.loads(line)
+                prompt = entry.get('prompt', '').strip()
+                completion = entry.get('completion', '').strip()
+                prompts.append(prompt)
+                completions.append(completion)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decoding failed at line {idx+1}: {e}")
+                prompts.append('')
+                completions.append('')
+    return {'prompt': prompts, 'completion': completions}
 
 # --------------------------
 # Function to load evaluation data from JSONL file
@@ -124,24 +154,20 @@ def preprocess_function(examples, tokenizer):
     inputs = examples['prompt']
     targets = examples['completion']
 
-    # Tokenize the prompts
+    # Combine prompts and completions with a separator
+    full_texts = [f"{prompt}\n\n### Answer:\n{completion}" for prompt, completion in zip(inputs, targets)]
+
+    # Tokenize the combined texts
     model_inputs = tokenizer(
-        inputs,
+        full_texts,
         max_length=1024,
         truncation=True,
         padding='max_length'
     )
 
-    # Tokenize the completions as labels
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(
-            targets,
-            max_length=128,
-            truncation=True,
-            padding='max_length'
-        )
+    labels = model_inputs['input_ids'].copy()
 
-    model_inputs['labels'] = labels['input_ids']
+    model_inputs['labels'] = labels
 
     # Explicitly preserve 'prompt' and 'completion' fields
     model_inputs['prompt'] = examples['prompt']
@@ -163,9 +189,9 @@ def custom_collate_fn(batch):
         dict: A dictionary with batched tensors and lists of strings.
     """
     # Stack tensor fields
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    labels = torch.stack([item['labels'] for item in batch])
+    input_ids = torch.stack([torch.tensor(item['input_ids']) for item in batch])
+    attention_mask = torch.stack([torch.tensor(item['attention_mask']) for item in batch])
+    labels = torch.stack([torch.tensor(item['labels']) for item in batch])
 
     # Collect string fields into lists
     prompts = [item['prompt'] for item in batch]
@@ -501,7 +527,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
 # Parse command-line arguments
 # --------------------------
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Fine-tune and evaluate CodeLlama with LoRA adapters.")
+    parser = argparse.ArgumentParser(description="Fine-tune and evaluate Mistral22B model with LoRA adapters.")
 
     # Existing arguments
     parser.add_argument('--interactive', action='store_true', help='Enter interactive chat mode after loading the model.')
@@ -511,6 +537,7 @@ def parse_arguments():
     # Parse the arguments
     args = parser.parse_args()
     return args
+
 # --------------------------
 # Main Execution Flow
 # --------------------------
@@ -528,13 +555,18 @@ def main():
 
         # Load the base model
         model = AutoModelForCausalLM.from_pretrained(
-            "Phind/Phind-CodeLlama-34B-v2",
+            "mistralai/Codestral-22B-v0.1",
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,
-            trust_remote_code=True
+            trust_remote_code=False,
+            use_cache=False
         )
+
+        model.config.use_cache = False
+        model.config.pretraining_tp = 1
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         # Load the LoRA adapters
         model = PeftModel.from_pretrained(model, save_directory)
@@ -543,9 +575,9 @@ def main():
 
         # Load the tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
-            "Phind/Phind-CodeLlama-34B-v2",
+            "mistralai/Codestral-22B-v0.1",
             cache_dir=cache_dir,
-            padding_side='left'
+            padding_side='right'
         )
 
         # Set the pad_token to eos_token if not already set
@@ -588,7 +620,7 @@ def main():
         # --------------------------
         # Perform Evaluation
         # --------------------------
-        num_samples = 80
+        num_samples = 20
         evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,
@@ -613,13 +645,18 @@ def main():
 
         # Load the base model
         model = AutoModelForCausalLM.from_pretrained(
-            "Phind/Phind-CodeLlama-34B-v2",
+            "mistralai/Codestral-22B-v0.1",
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
-            trust_remote_code=True              # Ensure custom code is handled
+            trust_remote_code=False,
+            use_cache=False
         )
+
+        model.config.use_cache = False
+        model.config.pretraining_tp = 1
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         # Load the LoRA adapters using PeftModel.from_pretrained
         model = PeftModel.from_pretrained(model, save_directory)
@@ -628,9 +665,9 @@ def main():
 
         # Load the tokenizer from the base model
         tokenizer = AutoTokenizer.from_pretrained(
-            "Phind/Phind-CodeLlama-34B-v2",
+            "mistralai/Codestral-22B-v0.1",
             cache_dir=cache_dir,
-            padding_side='left'
+            padding_side='right'
         )
 
         # Set the pad_token to eos_token if not already set
@@ -669,7 +706,7 @@ def main():
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_eval_jsonl('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
+        data = load_training_jsonl('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
         dataset = Dataset.from_dict(data)
 
         # --------------------------
@@ -688,11 +725,11 @@ def main():
         # --------------------------
         # Load the tokenizer
         # --------------------------
-        model_id = 'Phind/Phind-CodeLlama-34B-v2'
+        model_id = 'mistralai/Codestral-22B-v0.1'
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             cache_dir=cache_dir,
-            padding_side='left'
+            padding_side='right'
         )
 
         # Set the pad_token to eos_token if not already set
@@ -737,13 +774,6 @@ def main():
         print("Sample from tokenized_eval_dataset:")
         print(tokenized_eval_dataset[0])
 
-
-        # --------------------------
-        # Set format for PyTorch tensors, include prompt and completion
-        # --------------------------
-        tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
-        tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
-
         # --------------------------
         # Check if a saved model exists and load it if not retraining
         # --------------------------
@@ -757,8 +787,13 @@ def main():
                 device_map='auto',
                 torch_dtype=torch.float16,
                 quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
-                trust_remote_code=True              # Ensure custom code is handled
+                trust_remote_code=False,
+                use_cache=False
             )
+
+            model.config.use_cache = False
+            model.config.pretraining_tp = 1
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
             # Load the LoRA adapters using PeftModel.from_pretrained
             model = PeftModel.from_pretrained(model, save_directory)
@@ -775,22 +810,24 @@ def main():
                 device_map='auto',
                 torch_dtype=torch.float16,
                 quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
-                trust_remote_code=True              # Ensure custom code is handled
+                trust_remote_code=False,
+                use_cache=False
             )
 
             # Set use_cache to False to avoid incompatibility with gradient checkpointing
             model.config.use_cache = False
+            model.config.pretraining_tp = 1
 
             # Enable gradient checkpointing
-            model.gradient_checkpointing_enable()
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-            # Prepare the model for k-bit (8-bit) training
+            # Prepare the model for k-bit (4-bit) training
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
             # --------------------------
             # Define the target module names
             # --------------------------
-            target_module_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+            target_module_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
 
             # --------------------------
             # Apply LoRA configurations with correct target modules
@@ -798,7 +835,7 @@ def main():
             peft_config = LoraConfig(
                 r=16,
                 lora_alpha=32,
-                target_modules=target_module_names,  # Use only supported module names
+                target_modules=target_module_names,  # Use appropriate module names
                 lora_dropout=0.1,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM
@@ -817,22 +854,22 @@ def main():
                 output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
                 per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
                 per_device_eval_batch_size=3,
-                dataloader_num_workers = 8, # Same as training batch size
+                dataloader_num_workers=8,                    # Number of data loader workers
                 gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
                 num_train_epochs=5,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
                 logging_dir='./logs',                        # Directory for logging
-                logging_steps=100,                            # Increase logging frequency for better monitoring
+                logging_steps=100,                           # Increase logging frequency for better monitoring
                 save_strategy="steps",                       # Save checkpoints based on steps
-                save_steps=500,                              # Save every 100 steps to capture more checkpoints
+                save_steps=500,                              # Save every 500 steps
                 save_total_limit=10,                         # Limit to the last 10 checkpoints to save storage
                 evaluation_strategy="steps",                 # Enable evaluation
-                eval_steps=500,                              # Evaluate every 100 steps
+                eval_steps=500,                              # Evaluate every 500 steps
                 load_best_model_at_end=True,                 # Load the best model based on evaluation metric
                 metric_for_best_model="loss",                # Monitor loss for selecting the best model
                 fp16=True,                                   # Use mixed precision for faster training
-                optim="adamw_hf",                         # Use AdamW optimizer
+                optim="adamw_hf",                            # Use AdamW optimizer
                 lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
                 warmup_steps=100,                            # Minimal warmup steps to stabilize training start
                 max_grad_norm=1.0,                           # Enable gradient clipping
@@ -899,6 +936,25 @@ def main():
             model.save_pretrained(save_directory)
             print(f"Model saved to '{save_directory}'")
 
+        if not args.interactive:
+            logger.info("Starting evaluation...")
+
+            # Perform Evaluation with Generation and Compute ROUGE Metrics
+            num_samples = 20
+            evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
+                model=model,
+                tokenizer=tokenizer,
+                eval_dataset=tokenized_eval_dataset,
+                device='cuda',
+                batch_size=1,
+                max_new_tokens=40,
+                num_beams=3,
+                num_samples=num_samples,
+                seed=42
+            )
+
+            print("\nEvaluation Results (ROUGE scores):")
+            print(evaluation_results)
 
 if __name__ == "__main__":
     main()

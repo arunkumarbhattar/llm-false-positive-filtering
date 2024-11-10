@@ -56,12 +56,17 @@ save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql
 # --------------------------
 def load_jsonl_with_reasoning(file_path):
     """
-    Loads instruction, input, output, and reasoning from a JSONL file.
-    Combines 'instruction' and 'input' to create 'prompt', and appends 'reasoning' to 'completion'.
+    Loads 'prompt' and 'completion' from a JSONL file.
 
     Assumptions:
-    - Each JSON line contains 'instruction', 'input', 'output', and optionally 'reasoning'.
-    - If 'reasoning' is not present, only 'output' is used as 'completion'.
+    - Each JSON line contains 'prompt' and 'completion'.
+    - 'completion' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
+
+    Args:
+        file_path (str): Path to the JSONL file.
+
+    Returns:
+        dict: A dictionary with 'prompt' and 'completion' lists.
     """
     prompts = []
     completions = []
@@ -69,20 +74,9 @@ def load_jsonl_with_reasoning(file_path):
         for idx, line in enumerate(f):
             try:
                 entry = json.loads(line)
-                instruction = entry.get('instruction', '')
-                input_text = entry.get('input', '')
-                output = entry.get('output', '')
-                reasoning = entry.get('reasoning', '')  # Optional field
-
-                # Combine 'instruction' and 'input' to form the 'prompt'
-                prompt = instruction.strip() + '\n' + input_text.strip()
+                prompt = entry.get('prompt', '').strip()
+                completion = entry.get('completion', '').strip()
                 prompts.append(prompt)
-
-                # Append 'reasoning' to 'output', with reasoning coming first
-                if reasoning:
-                    completion = f"{reasoning.strip()}\n\n**Tool Selection**: {output.strip()}"
-                else:
-                    completion = output.strip()
                 completions.append(completion)
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decoding failed at line {idx+1}: {e}")
@@ -899,25 +893,6 @@ def main():
             model.save_pretrained(save_directory)
             print(f"Model saved to '{save_directory}'")
 
-        # --------------------------
-        # Proceed with Evaluation (Only if Not in Interactive Mode)
-        # --------------------------
-        if not args.interactive:
-            logger.info("Starting evaluation...")
-
-            # Perform Evaluation with Generation and Compute ROUGE Metrics
-            evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
-                model=model,
-                tokenizer=tokenizer,
-                eval_dataset=tokenized_eval_dataset,
-                device='cuda',            # Change to 'cpu' if GPU is not available
-                batch_size=1,             # Adjust batch size as needed
-                max_new_tokens=128,       # Adjust max_new_tokens as needed
-                num_beams=1               # Adjust num_beams as needed
-            )
-
-            print("\nEvaluation Results (ROUGE scores):")
-            print(evaluation_results)
 
 if __name__ == "__main__":
     main()

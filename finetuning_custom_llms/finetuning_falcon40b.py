@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import torch
 import argparse
@@ -32,34 +33,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------
-# Parse command-line arguments
-# --------------------------
-parser = argparse.ArgumentParser(description="Fine-tune Falcon model with optional retraining or interactive mode.")
-parser.add_argument(
-    "--retrain",
-    action="store_true",
-    help="If set, retrain the model even if a saved model exists."
-)
-parser.add_argument(
-    "--interactive",
-    action="store_true",
-    help="If set, load the trained model and start an interactive chat session."
-)
-args = parser.parse_args()
-
-# --------------------------
 # Specify the cache directory
 # --------------------------
 cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/falcon'
 
 # --------------------------
-# Define quantization configuration using BitsAndBytesConfig for 4-bit QLoRA
+# Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    bnb_8bit_use_double_quant=True,
-    bnb_8bit_quant_type="nf4",
-    bnb_8bit_compute_dtype=torch.float16
+    load_in_8bit=True,                       # Enable 8-bit quantization
+    bnb_8bit_use_double_quant=True,          # Use double quantization for better accuracy
+    bnb_8bit_quant_type="nf4",               # Quantization type; "nf4" is recommended for transformers
+    bnb_8bit_compute_dtype=torch.float16      # Compute dtype for 8-bit weights
 )
 
 # --------------------------
@@ -68,24 +53,51 @@ bnb_config = BitsAndBytesConfig(
 save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_falcon_codeql'
 
 # --------------------------
-# Function to load data from JSONL file
-# --------------------------
-def load_jsonl(file_path):
+def load_jsonl_with_reasoning(file_path):
     """
-    Loads instruction, input, and output pairs from a JSONL file.
-    Combines 'instruction' and 'input' to create 'prompt', and uses 'output' as 'completion'.
+    Loads 'prompt' and 'completion' from a JSONL file.
+
+    Assumptions:
+    - Each JSON line contains 'prompt' and 'completion'.
+    - 'completion' contains '**Tool Selection**: ...\n\n**Reasoning**: ...'
+
+    Args:
+        file_path (str): Path to the JSONL file.
+
+    Returns:
+        dict: A dictionary with 'prompt' and 'completion' lists.
+    """
+    prompts = []
+    completions = []
+    with open(file_path, 'r') as f:
+        for idx, line in enumerate(f):
+            try:
+                entry = json.loads(line)
+                prompt = entry.get('prompt', '').strip()
+                completion = entry.get('completion', '').strip()
+                prompts.append(prompt)
+                completions.append(completion)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decoding failed at line {idx+1}: {e}")
+                prompts.append('')
+                completions.append('')
+    return {'prompt': prompts, 'completion': completions}
+# --------------------------
+# Function to load evaluation data from JSONL file
+# --------------------------
+def load_eval_jsonl(file_path):
+    """
+    Loads 'prompt' and 'completion' pairs from a JSONL file.
     """
     prompts = []
     completions = []
     with open(file_path, 'r') as f:
         for line in f:
             entry = json.loads(line)
-            instruction = entry.get('instruction', '')
-            input_text = entry.get('input', '')
-            output = entry.get('output', '')
-            prompt = instruction.strip() + '\n' + input_text.strip()
-            prompts.append(prompt)
-            completions.append(output)
+            prompt = entry.get('prompt', '')
+            completion = entry.get('completion', '')
+            prompts.append(prompt.strip())
+            completions.append(completion.strip())
     return {'prompt': prompts, 'completion': completions}
 
 # --------------------------
@@ -129,78 +141,116 @@ def print_trainable_parameters(model):
 # --------------------------
 def preprocess_function(examples, tokenizer):
     """
-    Tokenizes the input prompts and completions.
-    Masks the prompt part in the labels to ignore them during loss computation.
+    Preprocesses the input examples by tokenizing the prompts and completions.
+
+    Args:
+        examples (dict): A batch of examples containing 'prompt' and 'completion'.
+        tokenizer: The tokenizer associated with the model.
+
+    Returns:
+        dict: A dictionary containing tokenized inputs and labels, along with the original 'prompt' and 'completion'.
     """
-    prompts = examples['prompt']
-    completions = examples['completion']
-    full_texts = [prompt + '\n' + completion for prompt, completion in zip(prompts, completions)]
+    inputs = examples['prompt']
+    targets = examples['completion']
 
-    # Tokenize prompts
-    tokenized_prompts = tokenizer(
-        prompts,
+    # Tokenize the prompts
+    model_inputs = tokenizer(
+        inputs,
+        max_length=1024,
         truncation=True,
-        max_length=1024,  # Adjust based on your data
         padding='max_length'
     )
 
-    # Tokenize full texts
-    tokenized_full_texts = tokenizer(
-        full_texts,
-        truncation=True,
-        max_length=1024,  # Adjust based on your data
-        padding='max_length'
-    )
+    # Tokenize the completions as labels
+    with tokenizer.as_target_tokenizer():
+        labels = tokenizer(
+            targets,
+            max_length=128,
+            truncation=True,
+            padding='max_length'
+        )
 
-    input_ids = tokenized_full_texts['input_ids']
-    attention_mask = tokenized_full_texts['attention_mask']
-    labels = []
+    model_inputs['labels'] = labels['input_ids']
 
-    for i in range(len(input_ids)):
-        # Calculate the actual length of the prompt (excluding padding)
-        prompt_len = sum(token != tokenizer.pad_token_id for token in tokenized_prompts['input_ids'][i])
-        label = input_ids[i].copy()
-        # Mask the prompt part in the labels
-        label[:prompt_len] = [-100] * prompt_len
-        labels.append(label)
+    # Explicitly preserve 'prompt' and 'completion' fields
+    model_inputs['prompt'] = examples['prompt']
+    model_inputs['completion'] = examples['completion']
 
-    # Prepare the final tokenized inputs
-    tokenized_full_texts['input_ids'] = input_ids
-    tokenized_full_texts['attention_mask'] = attention_mask
-    tokenized_full_texts['labels'] = labels
-    # Keep the prompts and completions
-    tokenized_full_texts['prompt'] = prompts
-    tokenized_full_texts['completion'] = completions
+    return model_inputs
 
-    return tokenized_full_texts
+# --------------------------
+# Custom collate function to handle mixed data types
+# --------------------------
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle mixed data types in batches.
+
+    Args:
+        batch (list): A list of dictionaries from the dataset.
+
+    Returns:
+        dict: A dictionary with batched tensors and lists of strings.
+    """
+    # Stack tensor fields
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+
+    # Collect string fields into lists
+    prompts = [item['prompt'] for item in batch]
+    completions = [item['completion'] for item in batch]
+
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels,
+        'prompt': prompts,
+        'completion': completions
+    }
+
 
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1):
+def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=80, seed=None):
     """
-    Generates completions for the evaluation dataset, extracts unique tool names,
-    computes ROUGE metrics, and dumps evaluation details into a JSONL file.
+    Generates completions for a randomly sampled subset of the evaluation dataset,
+    extracts unique tool names, compares them against expected tools, computes evaluation metrics,
+    and dumps evaluation details into a JSONL file.
 
     Args:
-        model: The language model to evaluate.
+        model: The language model to be evaluated.
         tokenizer: The tokenizer associated with the model.
-        eval_dataset: The evaluation dataset.
+        eval_dataset: The evaluation dataset containing 'prompt' and 'completion' fields.
         device (str): The device to run the model on ('cuda' or 'cpu').
-        batch_size (int): Number of samples per batch.
-        max_new_tokens (int): Maximum number of new tokens to generate.
-        num_beams (int): Number of beams for beam search.
+        batch_size (int): The batch size for evaluation.
+        max_new_tokens (int): The maximum number of new tokens to generate.
+        num_beams (int): The number of beams for beam search.
+        num_samples (int): The number of samples to evaluate.
+        seed (int, optional): Random seed for reproducibility.
 
     Returns:
-        result (dict): ROUGE scores.
-        generated_completions (list): List of extracted tool names from generated outputs.
-        reference_completions (list): List of expected tool names.
-        prompts (list): List of prompts used for generation.
+        dict: A dictionary containing evaluation metrics.
+        list: Generated completions.
+        list: Reference completions.
+        list: Prompts.
     """
+
+    # --------------------------
+    # Set random seed for reproducibility if provided
+    # --------------------------
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
+
+    # --------------------------
     # Load ROUGE metric
+    # --------------------------
     rouge = evaluate.load("rouge")
 
-    # Define the list of possible tools
+    # --------------------------
+    # Define the list of possible tools (without 'functions.' prefix)
+    # --------------------------
     possible_tools = [
         "get_func_definition",
         "get_path_constraint",
@@ -212,52 +262,117 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         "get_variable_usage_paths"
     ]
 
-    # Create a regex pattern to match any of the possible tools
-    # The pattern ensures full word matching using word boundaries
-    tool_pattern = re.compile(r'\b(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
+    # --------------------------
+    # Create a regex pattern to match any of the possible tools, possibly preceded by 'functions.'
+    # This pattern captures the tool name without the 'functions.' prefix.
+    # Example matches: 'functions.get_func_definition' or 'get_func_definition'
+    # The tool name is captured in group(1).
+    # --------------------------
+    tool_pattern = re.compile(r'\b(?:functions\.)?(' + '|'.join(map(re.escape, possible_tools)) + r')\b')
 
-    # Create DataLoader for evaluation
-    eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size)
+    # --------------------------
+    # Determine the number of samples to evaluate
+    # --------------------------
+    total_samples = len(eval_dataset)
+    if num_samples > total_samples:
+        raise ValueError(f"num_samples ({num_samples}) cannot be greater than the size of eval_dataset ({total_samples}).")
 
+    # --------------------------
+    # Randomly sample indices for evaluation
+    # --------------------------
+    sampled_indices = random.sample(range(total_samples), num_samples)
+
+    # --------------------------
+    # Create a subset of the evaluation dataset
+    # --------------------------
+    eval_subset = Subset(eval_dataset, sampled_indices)
+
+    print("Columns in eval_dataset:", eval_dataset.column_names)
+    print("Columns in eval_subset:", eval_subset.dataset.column_names)  # eval_subset is a Subset
+
+    # --------------------------
+    # Create DataLoader for the subset
+    # --------------------------
+    eval_dataloader = DataLoader(
+        eval_subset,
+        batch_size=batch_size,
+        collate_fn=custom_collate_fn  # Ensure this function is defined elsewhere in your script
+    )
+
+    # --------------------------
     # Initialize lists to store results
+    # --------------------------
     generated_completions = []
     reference_completions = []
     prompts = []
     model_outputs = []
     extracted_outputs = []
+    extracted_expected_tools = []
+    extracted_predicted_tools = []
 
+    # --------------------------
+    # Move model to the specified device and set to evaluation mode
+    # --------------------------
+    model.to(device)
     model.eval()
 
-    # Generation parameters
+    # --------------------------
+    # Define generation parameters
+    # --------------------------
     generation_kwargs = {
-        "max_new_tokens": max_new_tokens,  # Number of new tokens to generate
+        "max_new_tokens": max_new_tokens,
         "num_beams": num_beams,
-        "early_stopping": True,
+        "early_stopping": num_beams > 1,
         "do_sample": False,
-        "pad_token_id": tokenizer.eos_token_id  # Ensure pad_token_id is set
+        "pad_token_id": tokenizer.eos_token_id
     }
 
+    # --------------------------
     # Define the output JSONL file
+    # --------------------------
     output_jsonl = 'evaluation_details.jsonl'
 
+    # --------------------------
     # Remove existing JSONL file if it exists to avoid appending to old data
+    # --------------------------
     if os.path.exists(output_jsonl):
         os.remove(output_jsonl)
 
+    # --------------------------
+    # Log the start of evaluation
+    # --------------------------
+    print("INFO:__main__:Starting evaluation on a subset of the dataset...")
+
+    # --------------------------
+    # Initialize counters for set-based metrics
+    # --------------------------
+    total_correct = 0
+    total_predicted = 0
+    total_reference = 0
+
+    # --------------------------
+    # Initialize lists for set-based metrics
+    # --------------------------
+    all_predicted_tool_sets = []
+    all_reference_tool_sets = []
+
+    # --------------------------
+    # Disable gradient computation for evaluation
+    # --------------------------
     with torch.no_grad():
+        # --------------------------
+        # Iterate over batches in the DataLoader
+        # --------------------------
         for batch in tqdm(eval_dataloader, desc="Generating completions"):
             prompts_batch = batch['prompt']
-            input_ids_list = []
-            attention_mask_list = []
-            for prompt in prompts_batch:
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512, padding='max_length')
-                input_ids_list.append(inputs['input_ids'][0])
-                attention_mask_list.append(inputs['attention_mask'][0])
+            reference_batch = batch['completion']
 
-            input_ids = torch.stack(input_ids_list).to(model.device)
-            attention_mask = torch.stack(attention_mask_list).to(model.device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
 
-            # Generate completions
+            # --------------------------
+            # Generate completions using the model
+            # --------------------------
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -266,112 +381,260 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             model_outputs.extend(decoded_preds)
 
+            # --------------------------
             # Process each generated completion to extract unique tools
+            # --------------------------
             processed_completions = []
+            predicted_tool_sets = []
             for pred in decoded_preds:
                 # Find all tool matches in the prediction
                 tools_found = tool_pattern.findall(pred)
                 # Get unique tools while preserving order
                 unique_tools = list(dict.fromkeys(tools_found))
-                # Join with commas
+                # Extract function names without the 'functions.' prefix
+                extracted_tools = [tool for tool in unique_tools]
+                predicted_tool_sets.append(set(extracted_tools))
+                # Join with commas for logging or other purposes
                 if unique_tools:
                     processed_completion = ', '.join(unique_tools)
                 else:
-                    processed_completion = ""  # Assign empty string if no tools found
+                    processed_completion = ""
                 processed_completions.append(processed_completion)
             extracted_outputs.extend(processed_completions)
             generated_completions.extend(processed_completions)
-            reference_completions.extend(batch['completion'])
+            reference_completions.extend(reference_batch)
             prompts.extend(prompts_batch)
+            extracted_predicted_tools.extend(predicted_tool_sets)
 
+            # --------------------------
+            # Extract expected tools from reference_batch by parsing the tool selection
+            # --------------------------
+            expected_tool_sets = []
+            for ref in reference_batch:
+                # Extract the tool selection part before the reasoning
+                # Assumes the format: "**Tool Selection**: tools...\n\n**Reasoning**: ..."
+                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
+                if tool_selection_match:
+                    tool_selection = tool_selection_match.group(1)
+                else:
+                    # If no reasoning is present, extract everything after '**Tool Selection**:'
+                    tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
+                    if tool_selection_match:
+                        tool_selection = tool_selection_match.group(1)
+                    else:
+                        tool_selection = ''
+
+                # Extract tool names using regex
+                tools_in_ref = tool_pattern.findall(tool_selection)
+                extracted_ref_tools = [tool for tool in tools_in_ref]
+                expected_tool_sets.append(set(extracted_ref_tools))
+            extracted_expected_tools.extend(expected_tool_sets)
+
+            # --------------------------
+            # Compute set-based metrics for each sample
+            # --------------------------
+            for pred_set, ref_set in zip(predicted_tool_sets, expected_tool_sets):
+                correct = len(pred_set.intersection(ref_set))
+                total_correct += correct
+                total_predicted += len(pred_set)
+                total_reference += len(ref_set)
+                all_predicted_tool_sets.append(pred_set)
+                all_reference_tool_sets.append(ref_set)
+
+            # --------------------------
+            # Debug print statements after processing
+            # --------------------------
+            print("Prompts batch:", prompts_batch)
+            print("Reference completions batch:", reference_batch)
+
+            # --------------------------
             # Dump the current batch's details to the JSONL file
+            # --------------------------
             with open(output_jsonl, 'a') as f:
                 for i in range(len(prompts_batch)):
                     f.write(json.dumps({
                         'prompt': prompts_batch[i],
                         'model_output': decoded_preds[i],
                         'extracted_output': processed_completions[i],
-                        'expected_output': batch['completion'][i]
+                        'expected_output': reference_batch[i]
                     }) + '\n')
 
-    # Compute ROUGE scores
-    result = rouge.compute(predictions=generated_completions, references=reference_completions, use_stemmer=True)
+    # --------------------------
+    # Compute set-based metrics: Precision, Recall, F1 Score
+    # --------------------------
+    precision = (total_correct / total_predicted) * 100 if total_predicted > 0 else 0.0
+    recall = (total_correct / total_reference) * 100 if total_reference > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-    # Scale the scores
-    result = {key: value * 100 for key, value in result.items()}
+    # --------------------------
+    # Compute ROUGE scores on tool selections
+    # --------------------------
+    # Extract tool selection strings from expected completions
+    reference_tool_selections = []
+    for ref in reference_completions:
+        # Extract the tool selection part before the reasoning
+        tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
+        if tool_selection_match:
+            tool_selection = tool_selection_match.group(1)
+        else:
+            # If no reasoning is present, extract everything after '**Tool Selection**:'
+            tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
+            if tool_selection_match:
+                tool_selection = tool_selection_match.group(1)
+            else:
+                tool_selection = ''
 
-    # Round the results for readability
-    result = {k: round(v, 4) for k, v in result.items()}
+        reference_tool_selections.append(tool_selection)
 
+    # Use the processed_completions which are the extracted_output (comma-separated tools) as predictions
+    predictions_tool_selections = generated_completions
+
+    # Compute ROUGE scores on tool selections
+    rouge_result = rouge.compute(predictions=predictions_tool_selections, references=reference_tool_selections, use_stemmer=True)
+
+    # Scale the ROUGE scores to percentages
+    rouge_result = {key: value * 100 for key, value in rouge_result.items()}
+
+    # Round the ROUGE scores for readability
+    rouge_result = {k: round(v, 4) for k, v in rouge_result.items()}
+
+    # --------------------------
+    # Compile all evaluation metrics
+    # --------------------------
+    metrics = {
+        'precision': round(precision, 4),
+        'recall': round(recall, 4),
+        'f1': round(f1, 4),
+        'rouge1': round(rouge_result.get('rouge1', 0.0), 4),
+        'rouge2': round(rouge_result.get('rouge2', 0.0), 4),
+        'rougeL': round(rouge_result.get('rougeL', 0.0), 4),
+        'rougeLsum': round(rouge_result.get('rougeLsum', 0.0), 4)
+    }
+
+    # --------------------------
+    # Print and return the evaluation results
+    # --------------------------
     print(f"Saved evaluation details to '{output_jsonl}'")
+    print(f"Evaluation Metrics:")
+    print(f"Precision: {metrics['precision']}%")
+    print(f"Recall: {metrics['recall']}%")
+    print(f"F1 Score: {metrics['f1']}%")
+    print(f"ROUGE1: {metrics['rouge1']}%")
+    print(f"ROUGE2: {metrics['rouge2']}%")
+    print(f"ROUGE-L: {metrics['rougeL']}%")
+    print(f"ROUGE-Lsum: {metrics['rougeLsum']}%")
 
-    return result, generated_completions, reference_completions, prompts
-
-# --------------------------
-# Function to generate and print sample summaries
-# --------------------------
-def generate_sample_summaries(eval_dataset, tokenizer, model, device='cuda', num_samples=5):
-    """
-    Generates and prints sample summaries from the evaluation dataset.
-    """
-    print("\nSample Generated Summaries:")
-    model.eval()
-    for i in range(num_samples):
-        sample = eval_dataset[i]
-        prompt = sample['prompt']
-        # Tokenize the prompt
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512, padding='max_length').to(model.device)
-
-        # Generate completion
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
-                max_new_tokens=128,  # Adjust as needed
-                num_beams=1,         # Adjust as needed
-                early_stopping=True,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id  # Ensure pad_token_id is set
-            )
-        # Exclude the prompt tokens from the outputs
-        generated_tokens = outputs[:, inputs['input_ids'].shape[1]:]
-        completion = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-
-        # Reference completion
-        reference_completion = sample['completion']
-
-        print(f"\nSample {i+1}:")
-        print("Prompt:")
-        print(prompt)
-        print("Generated Completion:")
-        print(completion)
-        print("Reference Completion:")
-        print(reference_completion)
+    return metrics, generated_completions, reference_completions, prompts
 
 # --------------------------
-# Function to save evaluation summaries to a JSONL file
+# Parse command-line arguments
 # --------------------------
-def save_evaluation_summaries(generated_completions, reference_completions, prompts, filename, num_samples=100):
-    """
-    Saves generated and reference summaries to a JSONL file.
-    """
-    with open(filename, 'w') as f:
-        for i in tqdm(range(min(num_samples, len(generated_completions))), desc=f"Saving summaries to {filename}"):
-            f.write(json.dumps({
-                'prompt': prompts[i],
-                'reference_completion': reference_completions[i],
-                'generated_completion': generated_completions[i]
-            }) + '\n')
-    print(f"Saved {min(num_samples, len(generated_completions))} summaries to {filename}")
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Fine-tune and evaluate Falcon model with LoRA adapters.")
+
+    # Existing arguments
+    parser.add_argument('--interactive', action='store_true', help='Enter interactive chat mode after loading the model.')
+    parser.add_argument('--retrain', action='store_true', help='Retrain the model even if a saved model exists.')
+    parser.add_argument('--only_eval', action='store_true', help='Perform only evaluation without training.')
+    parser.add_argument('--train', action='store_true', help='Perform training.')
+    # Parse the arguments
+    args = parser.parse_args()
+    return args
 
 # --------------------------
 # Main Execution Flow
 # --------------------------
 
 def main():
-    # --------------------------
-    # Handle Interactive Mode
-    # --------------------------
+    args = parse_arguments()
+
+    if args.only_eval:
+        logger.info("Only evaluation mode activated. Skipping training and interactive modes.")
+
+        # Ensure that a saved model exists
+        if not os.path.exists(save_directory):
+            logger.error(f"Save directory '{save_directory}' does not exist. Cannot perform evaluation.")
+            exit(1)
+
+        # Load the base model
+        model = AutoModelForCausalLM.from_pretrained(
+            "tiiuae/falcon-40b-instruct",
+            cache_dir=cache_dir,
+            device_map='auto',
+            torch_dtype=torch.float16,
+            quantization_config=bnb_config,
+            trust_remote_code=False
+        )
+
+        # Load the LoRA adapters
+        model = PeftModel.from_pretrained(model, save_directory)
+        model.eval()
+        model.config.use_cache = True
+
+        # Load the tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            "tiiuae/falcon-40b-instruct",
+            cache_dir=cache_dir,
+            padding_side='left'
+        )
+
+        # Set the pad_token to eos_token if not already set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # --------------------------
+        # Load the Evaluation Dataset
+        # --------------------------
+        eval_data_path = 'eval_prompt_completion.jsonl'
+        eval_data = load_eval_jsonl(eval_data_path)
+        eval_dataset = Dataset.from_dict(eval_data)
+
+        # --------------------------
+        # Tokenize the Evaluation Dataset
+        # --------------------------
+        print("Original columns in eval_dataset:", eval_dataset.column_names)
+
+        tokenized_eval_dataset = eval_dataset.map(
+            lambda examples: preprocess_function(examples, tokenizer),
+            batched=True,
+            remove_columns=[],  # Do not remove columns
+            load_from_cache_file=False  # Ensure changes take effect
+        )
+
+        # Set format for PyTorch tensors, include 'prompt' and 'completion'
+        tokenized_eval_dataset.set_format(
+            type='torch',
+            columns=['input_ids', 'attention_mask', 'labels'],
+            output_all_columns=True  # Retain 'prompt' and 'completion'
+        )
+
+        print("Columns in tokenized_eval_dataset after tokenization:")
+        print(tokenized_eval_dataset.column_names)
+
+        # Optional: Print a sample to verify
+        print("Sample entry from tokenized_eval_dataset:")
+        print(tokenized_eval_dataset[0])
+
+        # --------------------------
+        # Perform Evaluation
+        # --------------------------
+        num_samples = 20
+        evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
+            model=model,
+            tokenizer=tokenizer,
+            eval_dataset=tokenized_eval_dataset,
+            device='cuda',
+            batch_size=1,
+            max_new_tokens=40,
+            num_beams=3,
+            num_samples=num_samples,
+            seed=42
+        )
+        print("\nEvaluation Results (ROUGE scores):")
+        print(evaluation_results)
+
+        exit(0)  # Exit after evaluation
+
     if args.interactive:
         if not os.path.exists(save_directory):
             logger.error(f"Save directory '{save_directory}' does not exist. Cannot enter interactive mode.")
@@ -384,8 +647,8 @@ def main():
             cache_dir=cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
-            # quantization_config=bnb_config,
-            trust_remote_code=False
+            quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+            trust_remote_code=False              # Ensure custom code is handled
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
@@ -414,7 +677,7 @@ def main():
                 print("Please enter a valid prompt or type 'exit' to quit.")
                 continue
             # Tokenize the user input
-            inputs = tokenizer(user_input, return_tensors="pt", truncation=True, max_length=512, padding='max_length').to(model.device)
+            inputs = tokenizer(user_input, return_tensors="pt", truncation=True, max_length=4096, padding='max_length').to(model.device)
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids=inputs['input_ids'],
@@ -432,263 +695,237 @@ def main():
             print(f"Model: {response}")
         exit(0)  # Exit the script after the chat session
 
-    # --------------------------
-    # Load your training data
-    # --------------------------
-    data = load_jsonl('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
-    dataset = Dataset.from_dict(data)
+    if args.train:
+        # --------------------------
+        # Load your training data
+        # --------------------------
+        data = load_training_jsonl('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
+        dataset = Dataset.from_dict(data)
 
-    # --------------------------
-    # Split the dataset into training and evaluation sets
-    # --------------------------
-    split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
-    train_dataset = split_dataset['train']
-    eval_dataset = split_dataset['test']
+        # --------------------------
+        # Split the dataset into training and evaluation sets
+        # --------------------------
+        split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
+        train_dataset = split_dataset['train']
+        eval_dataset = split_dataset['test']
 
-    # --------------------------
-    # Dump prompt and completion pairs to JSONL files
-    # --------------------------
-    dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
-    dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
+        # --------------------------
+        # Dump prompt and completion pairs to JSONL files
+        # --------------------------
+        dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
+        dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
 
-    # --------------------------
-    # Load the tokenizer
-    # --------------------------
-    model_id = 'tiiuae/falcon-40b-instruct'
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        cache_dir=cache_dir,
-        padding_side='left'  # Ensure padding side is left
-    )
-
-    # Set the pad_token to eos_token if not already set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # --------------------------
-    # Apply the preprocessing
-    # --------------------------
-    tokenized_train_dataset = train_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=train_dataset.column_names  # Remove original columns
-    )
-
-    tokenized_eval_dataset = eval_dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=eval_dataset.column_names  # Remove original columns
-    )
-
-    # --------------------------
-    # Set format for PyTorch tensors, include prompt and completion
-    # --------------------------
-    tokenized_train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
-    tokenized_eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'], output_all_columns=True)
-
-    # --------------------------
-    # Check if a saved model exists and load it if not retraining
-    # --------------------------
-    if os.path.exists(save_directory) and not args.retrain:
-        logger.info(f"Found a saved model in '{save_directory}'. Loading the model and skipping training.")
-
-        # Load the base model
-        model = AutoModelForCausalLM.from_pretrained(
+        # --------------------------
+        # Load the tokenizer
+        # --------------------------
+        model_id = 'tiiuae/falcon-40b-instruct'
+        tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             cache_dir=cache_dir,
-            device_map='auto',
-            torch_dtype=torch.float16,
-            quantization_config=bnb_config,
-            trust_remote_code=False
+            padding_side='left'
         )
 
-        # Load the LoRA adapters using PeftModel.from_pretrained
-        model = PeftModel.from_pretrained(model, save_directory)
-        model.eval()
-        model.config.use_cache = True
+        # Set the pad_token to eos_token if not already set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    else:
-        logger.info("No saved model found or retraining requested. Proceeding with training.")
-
-        # Load the base model with quantization_config
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
-            device_map='auto',
-            torch_dtype=torch.float16,
-            quantization_config=bnb_config,
-            trust_remote_code=False
+        # --------------------------
+        # Apply the preprocessing
+        # --------------------------
+        tokenized_train_dataset = train_dataset.map(
+            lambda examples: preprocess_function(examples, tokenizer),
+            batched=True,
+            remove_columns=[],  # Do not remove columns
+            load_from_cache_file=False  # Ensure changes take effect
         )
 
-        # Set use_cache to False to avoid incompatibility with gradient checkpointing
-        model.config.use_cache = False
+        tokenized_eval_dataset = eval_dataset.map(
+            lambda examples: preprocess_function(examples, tokenizer),
+            batched=True,
+            remove_columns=[],  # Do not remove columns
+            load_from_cache_file=False  # Ensure changes take effect
+        )
 
-        # Set pad_token_id in the model's configuration
-        model.config.pad_token_id = tokenizer.eos_token_id
+        # Set format for PyTorch tensors
+        tokenized_train_dataset.set_format(
+            type='torch',
+            columns=['input_ids', 'attention_mask', 'labels'],
+            output_all_columns=True
+        )
+        tokenized_eval_dataset.set_format(
+            type='torch',
+            columns=['input_ids', 'attention_mask', 'labels'],
+            output_all_columns=True
+        )
 
-        # Enable gradient checkpointing
-        model.gradient_checkpointing_enable()
+        # --------------------------
+        # Print sample entries after tokenization
+        # --------------------------
+        print("Sample from tokenized_train_dataset:")
+        print(tokenized_train_dataset[0])
 
-        # Prepare the model for k-bit (4-bit) training
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+        print("Sample from tokenized_eval_dataset:")
+        print(tokenized_eval_dataset[0])
 
-        # Apply LoRA configurations
-        peft_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=[
+        # --------------------------
+        # Check if a saved model exists and load it if not retraining
+        # --------------------------
+        if os.path.exists(save_directory) and not args.retrain:
+            logger.info(f"Found a saved model in '{save_directory}'. Loading the model and skipping training.")
+
+            # Load the base model
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                device_map='auto',
+                torch_dtype=torch.float16,
+                quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+                trust_remote_code=False
+            )
+
+            # Load the LoRA adapters using PeftModel.from_pretrained
+            model = PeftModel.from_pretrained(model, save_directory)
+            model.eval()
+            model.config.use_cache = True
+
+        else:
+            logger.info("No saved model found or retraining requested. Proceeding with training.")
+
+            # Load the base model with quantization_config
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                device_map='auto',
+                torch_dtype=torch.float16,
+                quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
+                trust_remote_code=False
+            )
+
+            # Set use_cache to False to avoid incompatibility with gradient checkpointing
+            model.config.use_cache = False
+
+            # Enable gradient checkpointing
+            model.gradient_checkpointing_enable()
+
+            # Prepare the model for k-bit (8-bit) training
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+            # --------------------------
+            # Define the target module names specific to Falcon
+            # --------------------------
+            target_module_names = [
                 "query_key_value",
                 "dense",
                 "dense_h_to_4h",
                 "dense_4h_to_h",
-            ],
-            lora_dropout=0.1,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM
-        )
+            ]
 
-        # Apply PEFT model
-        model = get_peft_model(model, peft_config)
+            # --------------------------
+            # Apply LoRA configurations with correct target modules
+            # --------------------------
+            peft_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=target_module_names,  # Use Falcon-specific module names
+                lora_dropout=0.1,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM
+            )
 
-        # Verify trainable parameters
-        print_trainable_parameters(model)
+            # Apply PEFT model
+            model = get_peft_model(model, peft_config)
 
-        # --------------------------
-        # Define training arguments
-        # --------------------------
-        training_args = TrainingArguments(
-            output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
-            per_device_train_batch_size=1,              # Keep batch size small due to potential GPU memory constraints
-            per_device_eval_batch_size=1,               # Same as training batch size
-            gradient_accumulation_steps=8,              # Increase to simulate a larger effective batch size
-            num_train_epochs=7,                        # Significantly increase epochs to allow extensive training
-            learning_rate=1e-5,                          # Lower learning rate for finer weight updates
-            weight_decay=0.0,                            # Remove weight decay to reduce regularization
-            logging_dir='./logs',                        # Directory for logging
-            logging_steps=10,                            # Increase logging frequency for better monitoring
-            save_strategy="steps",                       # Save checkpoints based on steps
-            save_steps=100,                              # Save every 100 steps to capture more checkpoints
-            save_total_limit=None,                       # Allow unlimited checkpoints to prevent overwriting
-            evaluation_strategy="steps",                    # Disable evaluation to focus solely on training accuracy
-            load_best_model_at_end=True,                # Do not load the best model based on evaluation (since eval is disabled)
-            # metric_for_best_model="eval_loss",         # Not needed as evaluation is disabled
-            fp16=True,                                   # Use mixed precision for faster training
-            optim="adamw_torch",                         # Use AdamW optimizer
-            lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
-            warmup_steps=100,                            # Minimal warmup steps to stabilize training start
-            max_grad_norm=0.0,                            # Disable gradient clipping to allow larger gradient updates
-            gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
-            torch_compile=False,                         # Disable Torch compilation for compatibility
-            report_to="none",                            # Disable reporting to external systems
-        )
+            # Verify trainable parameters
+            print_trainable_parameters(model)
 
-        # --------------------------
-        # Define custom callback for detecting abnormal loss
-        # --------------------------
-        class CustomCallback(TrainerCallback):
-            def on_step_end(self, args, state, control, **kwargs):
-                # Ensure that log_history is non-empty before accessing the last element
-                if not state.log_history:
-                    logger.warning(f"At step {state.global_step}: 'log_history' is empty.")
-                    return  # Exit early since there's nothing to process
+            # --------------------------
+            # Define training arguments
+            # --------------------------
+            training_args = TrainingArguments(
+                output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
+                per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
+                per_device_eval_batch_size=3,
+                dataloader_num_workers=8,                    # Number of data loader workers
+                gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
+                num_train_epochs=5,                          # Adjusted number of epochs
+                learning_rate=1e-5,                          # Lower learning rate for finer weight updates
+                weight_decay=0.0,                            # Remove weight decay to reduce regularization
+                logging_dir='./logs',                        # Directory for logging
+                logging_steps=100,                           # Increase logging frequency for better monitoring
+                save_strategy="steps",                       # Save checkpoints based on steps
+                save_steps=500,                              # Save every 500 steps
+                save_total_limit=10,                         # Limit to the last 10 checkpoints to save storage
+                evaluation_strategy="steps",                 # Enable evaluation
+                eval_steps=500,                              # Evaluate every 500 steps
+                load_best_model_at_end=True,                 # Load the best model based on evaluation metric
+                metric_for_best_model="loss",                # Monitor loss for selecting the best model
+                fp16=True,                                   # Use mixed precision for faster training
+                optim="adamw_hf",                         # Use AdamW optimizer
+                lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
+                warmup_steps=100,                            # Minimal warmup steps to stabilize training start
+                max_grad_norm=1.0,                           # Enable gradient clipping
+                gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
+                torch_compile=False,                         # Disable Torch compilation for compatibility
+                report_to="none",                            # Disable reporting to external systems
+            )
 
-                # Access the last entry in log_history
-                last_log = state.log_history[-1]
+            # --------------------------
+            # Define custom callback for detecting abnormal loss
+            # --------------------------
+            class CustomCallback(TrainerCallback):
+                def on_step_end(self, args, state, control, **kwargs):
+                    # Ensure that log_history is non-empty before accessing the last element
+                    if not state.log_history:
+                        logger.warning(f"At step {state.global_step}: 'log_history' is empty.")
+                        return  # Exit early since there's nothing to process
 
-                # Check if 'loss' is present in the last log entry
-                if 'loss' in last_log:
-                    loss = last_log['loss']
-                    logger.debug(f"At step {state.global_step}: loss = {loss}")
+                    # Access the last entry in log_history
+                    last_log = state.log_history[-1]
 
-                    # Detect abnormal loss values
-                    if loss > 1e4 or loss < 0:
-                        logger.error(f"Abnormal loss detected at step {state.global_step}: {loss}")
-                        control.should_terminate_training = True
-                else:
-                    logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
+                    # Check if 'loss' is present in the last log entry
+                    if 'loss' in last_log:
+                        loss = last_log['loss']
+                        logger.debug(f"At step {state.global_step}: loss = {loss}")
 
-        # --------------------------
-        # Data collator for language modeling
-        # --------------------------
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=tokenizer,
-            mlm=False  # Not using masked language modeling
-        )
+                        # Detect abnormal loss values
+                        if loss > 1e4 or loss < 0:
+                            logger.error(f"Abnormal loss detected at step {state.global_step}: {loss}")
+                            control.should_terminate_training = True
+                    else:
+                        logger.debug(f"At step {state.global_step}: 'loss' not found in log_history.")
 
-        # --------------------------
-        # Initialize the Trainer
-        # --------------------------
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=tokenized_train_dataset,
-            eval_dataset=tokenized_eval_dataset,
-            data_collator=data_collator,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
-            tokenizer=tokenizer,  # This ensures the tokenizer is saved with the model
-        )
+            # --------------------------
+            # Data collator for language modeling
+            # --------------------------
+            data_collator = DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                mlm=False  # Not using masked language modeling
+            )
 
-        # --------------------------
-        # Start training
-        # --------------------------
-        trainer.train()
+            # --------------------------
+            # Initialize the Trainer
+            # --------------------------
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_train_dataset,
+                eval_dataset=tokenized_eval_dataset,
+                data_collator=data_collator,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
+                tokenizer=tokenizer,  # This ensures the tokenizer is saved with the model
+            )
 
-        # --------------------------
-        # Save the LoRA adapters
-        # --------------------------
-        os.makedirs(save_directory, exist_ok=True)
-        model.save_pretrained(save_directory)
-        print(f"Model saved to '{save_directory}'")
+            # --------------------------
+            # Start training
+            # --------------------------
+            trainer.train()
 
-    # --------------------------
-    # Proceed with Evaluation (Only if Not in Interactive Mode)
-    # --------------------------
-    if not args.interactive:
-        logger.info("Starting evaluation...")
+            # --------------------------
+            # Save the LoRA adapters
+            # --------------------------
+            os.makedirs(save_directory, exist_ok=True)
+            model.save_pretrained(save_directory)
+            print(f"Model saved to '{save_directory}'")
 
-        # Perform Evaluation with Generation and Compute ROUGE Metrics
-        evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
-            model=model,
-            tokenizer=tokenizer,
-            eval_dataset=tokenized_eval_dataset,
-            device='cuda',            # Change to 'cpu' if GPU is not available
-            batch_size=1,             # Adjust batch size as needed
-            max_new_tokens=128,       # Adjust max_new_tokens as needed
-            num_beams=1               # Adjust num_beams as needed
-        )
-
-        print("\nEvaluation Results (ROUGE scores):")
-        print(evaluation_results)
-
-        # Show ground truth and generated outputs
-        print("\nGround Truth vs Generated Completions:")
-        num_samples_to_show = 5
-        for i in range(num_samples_to_show):
-            print(f"\nSample {i+1}:")
-            print("Prompt:")
-            print(prompts[i])
-            print("Ground Truth Completion:")
-            print(reference_completions[i])
-            print("Generated Completion:")
-            print(generated_completions[i])
-
-        # Optional: Generate and Print Sample Summaries
-        generate_sample_summaries(
-            eval_dataset=tokenized_eval_dataset,  # Use the tokenized eval_dataset
-            tokenizer=tokenizer,
-            model=model,
-            device='cuda',    # Change to 'cpu' if GPU is not available
-            num_samples=5
-        )
-
-        # Save evaluation summaries to a JSONL file
-        save_evaluation_summaries(
-            generated_completions=generated_completions,
-            reference_completions=reference_completions,
-            prompts=prompts,
-            filename='evaluation_summaries.jsonl',
-            num_samples=100
-        )
-
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
