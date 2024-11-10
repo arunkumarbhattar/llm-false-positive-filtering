@@ -823,7 +823,7 @@ def main():
                 per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
                 per_device_eval_batch_size=3,
                 dataloader_num_workers = 8, # Same as training batch size
-                gradient_accumulation_steps=3,               # Increase to simulate a larger effective batch size
+                gradient_accumulation_steps=1,               # Increase to simulate a larger effective batch size
                 num_train_epochs=5,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
@@ -838,12 +838,13 @@ def main():
                 metric_for_best_model="loss",                # Monitor loss for selecting the best model
                 fp16=True,                                   # Use mixed precision for faster training
                 optim="adamw_hf",                         # Use AdamW optimizer
-                lr_scheduler_type="linear",                  # Use a linear scheduler for simplicity
+                lr_scheduler_type="cosine_with_restarts",                  # Use a linear scheduler for simplicity
                 warmup_steps=100,                            # Minimal warmup steps to stabilize training start
                 max_grad_norm=1.0,                           # Enable gradient clipping
                 gradient_checkpointing=True,                 # Enable gradient checkpointing to save memory
                 torch_compile=False,                         # Disable Torch compilation for compatibility
                 report_to="none",                            # Disable reporting to external systems
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
             )
 
             # --------------------------
