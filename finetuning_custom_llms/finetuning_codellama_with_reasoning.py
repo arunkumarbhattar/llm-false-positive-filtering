@@ -889,7 +889,7 @@ def main():
                 train_dataset=tokenized_train_dataset,
                 eval_dataset=tokenized_eval_dataset,
                 data_collator=data_collator,
-                callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomCallback()],
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=2), CustomCallback()],
                 tokenizer=tokenizer,  # This ensures the tokenizer is saved with the model
             )
 
