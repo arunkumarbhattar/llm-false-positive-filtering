@@ -55,6 +55,38 @@ bnb_config = BitsAndBytesConfig(
 save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql_w_reasoning'
 
 # --------------------------
+def load_jsonl_with_reasoning_for_eval(file_path):
+    """
+    Loads 'prompt' and 'completion' from a JSONL file.
+
+    Assumptions:
+    - Each JSON line contains 'prompt' and 'completion' fields.
+
+    Args:
+        file_path (str): Path to the JSONL file.
+
+    Returns:
+        dict: A dictionary with 'prompt' and 'completion' lists.
+    """
+    prompts = []
+    completions = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for idx, line in enumerate(f, 1):
+            try:
+                entry = json.loads(line)
+
+                # Extract 'prompt' and 'completion' with default empty strings if not present
+                prompt = entry.get('prompt', '').strip()
+                completion = entry.get('completion', '').strip()
+
+                prompts.append(prompt)
+                completions.append(completion)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decoding failed at line {idx}: {e}")
+                prompts.append('')
+                completions.append('')
+    return {'prompt': prompts, 'completion': completions}
+
 def load_jsonl_with_reasoning(file_path):
     """
     Loads 'prompt' and 'completion' from a JSONL file.
@@ -562,7 +594,7 @@ def main():
         # Load the Evaluation Dataset
         # --------------------------
         eval_data_path = 'eval_prompt_completion.jsonl'
-        eval_data = load_jsonl_with_reasoning(eval_data_path)
+        eval_data = load_jsonl_with_reasoning_for_eval(eval_data_path)
         eval_dataset = Dataset.from_dict(eval_data)
 
         # --------------------------
@@ -594,7 +626,7 @@ def main():
         # --------------------------
         # Perform Evaluation
         # --------------------------
-        num_samples = 5
+        num_samples = 20
         evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,
