@@ -235,21 +235,6 @@ struct ControlDepGraphPrinter : public PassInfoMixin<ControlDepGraphPrinter> {
         MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
     auto &CDG = FAM.getResult<ControlDepGraph>(F);
 
-    // errs() << "Control Dependence Graph for function " << F.getName() <<
-    // ":\n"; for (auto &Entry : CDG) {
-    //   auto EntryRange = getLineRange(Entry.first);
-    // return Cond;
-    //   errs() << "  Lines " << EntryRange.first << "-" << EntryRange.second <<
-    //   " depend on:\n"; for (auto &Controller : Entry.second) {
-    //     unsigned ControllerLine = getBranchCondLine(Controller.first);
-    //     errs() << "    Lines " << ControllerLine << " via " <<
-    //     Controller.second << "\n";
-    //     //auto DependentRange = getLineRange(Dependent);
-    //     //errs() << "    Lines " << DependentRange.first << "-" <<
-    //     DependentRange.second << "\n";
-    //   }
-    // }
-
     RespJson["result"] = getPathCondition(TargetBB, CDG);
     writeResponse(RespJson);
     return PreservedAnalyses::all();

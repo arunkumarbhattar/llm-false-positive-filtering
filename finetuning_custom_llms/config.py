@@ -16,7 +16,7 @@ device = 'cuda'  # 'cuda' or 'cpu'
 torch_dtype = torch.float16  # Use float16 for reduced memory footprint
 
 # Cache directory for HuggingFace models
-cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codeql_llama/'
+cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codeql_falcon/'
 
 # Other options (commented out for future tweaking)
 # max_length = 2048

@@ -669,7 +669,7 @@ def main():
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_jsonl_with_reasoning('fine_tuning_training_data.jsonl')
+        data = load_jsonl_with_reasoning('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
         dataset = Dataset.from_dict(data)
 
         # --------------------------

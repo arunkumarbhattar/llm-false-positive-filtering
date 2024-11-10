@@ -146,25 +146,3 @@ std::string getControlCondAtLoc(std::string filename, unsigned lineNumber,
 
   return data.expressionText;
 }
-
-// int main(int argc, char** argv) {
-//     if (argc != 3) {
-//         std::cerr << "Usage: " << argv[0] << " <filename> <lineNumber>" <<
-//         std::endl; return 1;
-//     }
-//
-//     const char* filename = argv[1];
-//     int lineNumber = std::atoi(argv[2]);
-//     std::string condition = getIfConditionAtLine(filename, lineNumber);
-//     std::cout << condition << std::endl;
-//
-//     //if (!condition.empty()) {
-//     //    std::cout << "If condition at line " << lineNumber << ": " <<
-//     condition << std::endl;
-//     //} else {
-//     //    std::cout << "No if condition found at line " << lineNumber <<
-//     std::endl;
-//     //}
-//
-//     return 0;
-// }
