@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field
-from langchain.tools import tool
-from prompts import repo
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.tools import tool
+from langchain_core.runnables import chain
+
+repo = None
 ###################### LLVM tools #############################
 
 class FindVarDefInput(BaseModel):
@@ -9,7 +11,7 @@ class FindVarDefInput(BaseModel):
     varname: str = Field(..., description="The name of the local variable whose definitions are to be found.")
 
 @tool(args_schema=FindVarDefInput)
-def variable_def_finder(filename: str, lineno: int, varname: str) -> str:
+def variable_def_finder(**kwargs) -> str:
     """
     Finds all definitions of a local variable in a specified function within a given file.
 
@@ -17,16 +19,18 @@ def variable_def_finder(filename: str, lineno: int, varname: str) -> str:
     --------
     list[int]
         A list of the line numbers of all definitions of the specified
-        variable. If no definitions are found, the function returns an empty list.
+        variable. If no definitions are found, the function returns an empty list
     """
-    return repo.handle_llvm_tool_call(variable_def_finder.name, filename=filename, lineno=lineno, varname=varname)
+    from llm_triage import repo
+    return repo.handle_llvm_tool_call(variable_def_finder.name, **kwargs)
+
 
 class GetPathConstraintInput(BaseModel):
     filename: str = Field(..., description="The name (and path, if necessary) of the source file to analyze.")
     lineno: int = Field(..., description="The line number in the source file where the function containing the variable is defined.")
 
 @tool(args_schema=GetPathConstraintInput)
-def get_path_constraint(filename: str, lineno: int) -> str:
+def get_path_constraint(**kwargs):
     """
     Retrieves the path constraint for a specific source code location.
 
@@ -42,7 +46,9 @@ def get_path_constraint(filename: str, lineno: int) -> str:
         If no constraint is found or the analysis fails, an empty string or a relevant
         error message may be returned.
     """
-    return repo.handle_llvm_tool_call(get_path_constraint.name, filename=filename, lineno=lineno)
+    from llm_triage import repo
+    return repo.handle_llvm_tool_call(get_path_constraint.name, **kwargs)
+
 
 ###################### Python tools #############################
 
@@ -224,4 +230,13 @@ tool_list = [
     get_variable_usage_paths
 ]
 
+gpt_tool_list = [
+    get_func_definition,
+    variable_def_finder,
+    get_path_constraint
+]
+
+
 toolstr2callable = {tool.name: tool for tool in tool_list}
+
+gpt_toolstr2callable = {tool.name: tool for tool in gpt_tool_list}
