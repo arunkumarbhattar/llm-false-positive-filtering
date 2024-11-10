@@ -404,6 +404,15 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
                 attention_mask=attention_mask,
                 **generation_kwargs
             )
+            print("*********************************************************************************************\n")
+            print("*********************************************************************************************\n")
+
+
+            print(f"Model generated output {outputs}")
+
+            print("*********************************************************************************************\n")
+            print("*********************************************************************************************\n")
+
             decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             model_outputs.extend(decoded_preds)
 
