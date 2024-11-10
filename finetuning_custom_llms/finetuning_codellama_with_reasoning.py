@@ -455,7 +455,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     # --------------------------
     # Predictions are decoded_preds
     # References are reference_completions
-    rouge_result = rouge.compute(predictions=decoded_preds, references=reference_completions, use_stemmer=True)
+    rouge_result = rouge.compute(predictions=model_outputs, references=reference_completions, use_stemmer=True)
 
     # Scale the ROUGE scores to percentages
     rouge_result = {key: value * 100 for key, value in rouge_result.items()}
@@ -582,7 +582,7 @@ def main():
         # --------------------------
         # Perform Evaluation
         # --------------------------
-        num_samples = 20
+        num_samples = 5
         evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,
