@@ -217,9 +217,9 @@ def custom_collate_fn(batch):
         dict: A dictionary with batched tensors and lists of strings.
     """
     # Stack tensor fields
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    labels = torch.stack([item['labels'] for item in batch])
+    input_ids = torch.stack([torch.tensor(item['input_ids']) for item in batch])
+    attention_mask = torch.stack([torch.tensor(item['attention_mask']) for item in batch])
+    labels = torch.stack([torch.tensor(item['labels']) for item in batch])
 
     # Collect string fields into lists
     prompts = [item['prompt'] for item in batch]
@@ -237,12 +237,11 @@ def custom_collate_fn(batch):
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=20, seed=None):
+def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=80, seed=None):
     """
     Generates completions for a randomly sampled subset of the evaluation dataset,
-    extracts unique tool names from the **Tool Selection** section, compares them against expected tools,
-    computes evaluation metrics (Precision, Recall, F1 Score) based on tool matching,
-    and computes ROUGE scores on the full generated outputs including reasoning.
+    extracts unique tool names, compares them against expected tools, computes evaluation metrics,
+    and dumps evaluation details into a JSONL file.
 
     Args:
         model: The language model to be evaluated.
@@ -404,15 +403,6 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
                 attention_mask=attention_mask,
                 **generation_kwargs
             )
-            print("*********************************************************************************************\n")
-            print("*********************************************************************************************\n")
-
-
-            print(f"Model generated output {outputs}")
-
-            print("*********************************************************************************************\n")
-            print("*********************************************************************************************\n")
-
             decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             model_outputs.extend(decoded_preds)
 
@@ -422,26 +412,18 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             processed_completions = []
             predicted_tool_sets = []
             for pred in decoded_preds:
-                # Adjusted regex to match both '**Tool Selection**:' and 'Tools to invoke:'
-                tool_selection_match = re.search(r'(\*\*Tool Selection\*\*:|Tools to invoke:)\s*(.*)', pred, re.DOTALL | re.IGNORECASE)
-                if tool_selection_match:
-                    tool_selection = tool_selection_match.group(2)
-                else:
-                    tool_selection = ''
-
-                # Extract tool names using regex
-                tools_found = tool_pattern.findall(tool_selection)
-
-                # Extract tool names using regex
-                tools_found = tool_pattern.findall(tool_selection)
+                # Find all tool matches in the prediction
+                tools_found = tool_pattern.findall(pred)
+                # Get unique tools while preserving order
                 unique_tools = list(dict.fromkeys(tools_found))
+                # Extract function names without the 'functions.' prefix
                 extracted_tools = [tool for tool in unique_tools]
                 predicted_tool_sets.append(set(extracted_tools))
                 # Join with commas for logging or other purposes
                 if unique_tools:
                     processed_completion = ', '.join(unique_tools)
                 else:
-                    processed_completion = ''
+                    processed_completion = ""
                 processed_completions.append(processed_completion)
             extracted_outputs.extend(processed_completions)
             generated_completions.extend(processed_completions)
@@ -454,12 +436,18 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
             # --------------------------
             expected_tool_sets = []
             for ref in reference_batch:
-                # Extract the tool selection part after '**Tool Selection**:'
-                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref, re.DOTALL)
+                # Extract the tool selection part before the reasoning
+                # Assumes the format: "**Tool Selection**: tools...\n\n**Reasoning**: ..."
+                tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
                 if tool_selection_match:
                     tool_selection = tool_selection_match.group(1)
                 else:
-                    tool_selection = ''
+                    # If no reasoning is present, extract everything after '**Tool Selection**:'
+                    tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
+                    if tool_selection_match:
+                        tool_selection = tool_selection_match.group(1)
+                    else:
+                        tool_selection = ''
 
                 # Extract tool names using regex
                 tools_in_ref = tool_pattern.findall(tool_selection)
@@ -504,11 +492,30 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # --------------------------
-    # Compute ROUGE scores on full completions including reasoning
+    # Compute ROUGE scores on tool selections
     # --------------------------
-    # Predictions are decoded_preds
-    # References are reference_completions
-    rouge_result = rouge.compute(predictions=model_outputs, references=reference_completions, use_stemmer=True)
+    # Extract tool selection strings from expected completions
+    reference_tool_selections = []
+    for ref in reference_completions:
+        # Extract the tool selection part before the reasoning
+        tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*?)\n\n\*\*Reasoning\*\*:', ref, re.DOTALL)
+        if tool_selection_match:
+            tool_selection = tool_selection_match.group(1)
+        else:
+            # If no reasoning is present, extract everything after '**Tool Selection**:'
+            tool_selection_match = re.search(r'\*\*Tool Selection\*\*:\s*(.*)', ref)
+            if tool_selection_match:
+                tool_selection = tool_selection_match.group(1)
+            else:
+                tool_selection = ''
+
+        reference_tool_selections.append(tool_selection)
+
+    # Use the processed_completions which are the extracted_output (comma-separated tools) as predictions
+    predictions_tool_selections = generated_completions
+
+    # Compute ROUGE scores on tool selections
+    rouge_result = rouge.compute(predictions=predictions_tool_selections, references=reference_tool_selections, use_stemmer=True)
 
     # Scale the ROUGE scores to percentages
     rouge_result = {key: value * 100 for key, value in rouge_result.items()}
