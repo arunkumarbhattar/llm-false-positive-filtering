@@ -41,10 +41,7 @@ cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/falcon'
 # Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,                       # Enable 8-bit quantization
-    bnb_8bit_use_double_quant=True,          # Use double quantization for better accuracy
-    bnb_8bit_quant_type="nf4",               # Quantization type; "nf4" is recommended for transformers
-    bnb_8bit_compute_dtype=torch.float16      # Compute dtype for 8-bit weights
+    load_in_8bit=True
 )
 
 # --------------------------
