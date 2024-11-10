@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Specify the cache directory
 # --------------------------
 cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/mistral'
-
+access_token = "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"
 # --------------------------
 # Define quantization configuration using BitsAndBytesConfig for 4-bit QLoRA
 # --------------------------
@@ -561,7 +561,8 @@ def main():
             torch_dtype=torch.float16,
             quantization_config=bnb_config,
             trust_remote_code=False,
-            use_cache=False
+            use_cache=False,
+            token=access_token
         )
 
         model.config.use_cache = False
@@ -651,7 +652,8 @@ def main():
             torch_dtype=torch.float16,
             quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
             trust_remote_code=False,
-            use_cache=False
+            use_cache=False,
+            token=access_token
         )
 
         model.config.use_cache = False
@@ -788,7 +790,8 @@ def main():
                 torch_dtype=torch.float16,
                 quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
                 trust_remote_code=False,
-                use_cache=False
+                use_cache=False,
+                token=access_token
             )
 
             model.config.use_cache = False
@@ -811,7 +814,8 @@ def main():
                 torch_dtype=torch.float16,
                 quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
                 trust_remote_code=False,
-                use_cache=False
+                use_cache=False,
+                token=access_token
             )
 
             # Set use_cache to False to avoid incompatibility with gradient checkpointing
