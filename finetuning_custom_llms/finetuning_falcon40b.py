@@ -590,7 +590,7 @@ def main():
         # --------------------------
         # Load the Evaluation Dataset
         # --------------------------
-        eval_data_path = 'eval_prompt_completion.jsonl'
+        eval_data_path = 'eval_prompt_completion_falcon.jsonl'
         eval_data = load_eval_jsonl(eval_data_path)
         eval_dataset = Dataset.from_dict(eval_data)
 
@@ -717,8 +717,8 @@ def main():
         # --------------------------
         # Dump prompt and completion pairs to JSONL files
         # --------------------------
-        dump_prompt_completion(train_dataset, 'train_prompt_completion.jsonl')
-        dump_prompt_completion(eval_dataset, 'eval_prompt_completion.jsonl')
+        dump_prompt_completion(train_dataset, 'train_prompt_completion_falcon.jsonl')
+        dump_prompt_completion(eval_dataset, 'eval_prompt_completion_falcon.jsonl')
 
         # --------------------------
         # Load the tokenizer
@@ -848,11 +848,11 @@ def main():
             # --------------------------
             training_args = TrainingArguments(
                 output_dir='./fine_tuned_model',             # Directory to save the model checkpoints
-                per_device_train_batch_size=3,               # Keep batch size small due to potential GPU memory constraints
-                per_device_eval_batch_size=3,
+                per_device_train_batch_size=4,               # Keep batch size small due to potential GPU memory constraints
+                per_device_eval_batch_size=4,
                 dataloader_num_workers=8,                    # Number of data loader workers
-                gradient_accumulation_steps=2,               # Increase to simulate a larger effective batch size
-                num_train_epochs=3,                          # Adjusted number of epochs
+                gradient_accumulation_steps=1,               # Increase to simulate a larger effective batch size
+                num_train_epochs=2,                          # Adjusted number of epochs
                 learning_rate=1e-5,                          # Lower learning rate for finer weight updates
                 weight_decay=0.0,                            # Remove weight decay to reduce regularization
                 logging_dir='./logs',                        # Directory for logging
