@@ -3,12 +3,13 @@ import json
 import sys
 import argparse
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 
 from repository_manager import RepositoryManager, GroundTruth
 from tools import *
 import tools
+
 # ---------------------------- Chat Prompt Template ----------------------------
 
 CHAT_PROMPT = ChatPromptTemplate.from_messages(
@@ -41,35 +42,17 @@ class ResponseFormatter(BaseModel):
     )
     explanation: str = Field(description="Explanation for the classification decision")
 
-# ---------------------------- Language Model Initialization ----------------------------
-
-# Choose the appropriate model
-
-MODEL_NAME="gpt-3.5-turbo-0125"
-#MODEL_NAME="gpt-4o-mini-2024-07-18"
-#MODEL_NAME="gpt-4o-2024-05-13"
-
-# Initialize the ChatOpenAI model with desired parameters
-llm = ChatOpenAI(temperature=0.2, model=MODEL_NAME)
-
-# Bind tools to the language model
-llm_with_tools = llm.bind_tools(gpt_tool_list)
-
-# Set up structured output using the ResponseFormatter
-structured_llm = llm.with_structured_output(ResponseFormatter)
-
-# Create processing chains
-classification_chain = CHAT_PROMPT | llm_with_tools
-structured_decision_chain = CHAT_PROMPT | structured_llm
-
 # ---------------------------- Processing Function ----------------------------
 
-def process_juliet_repo(juliet_repo_path):
+def process_juliet_repo(juliet_repo_path, llvm_dir, llvm_passes_lib_dir, openai_api_key):
     """
     Process the Juliet test suite repository for CodeQL alerts classification.
 
     Args:
         juliet_repo_path (str): The base path to the Juliet test suite repository.
+        llvm_dir (str): Path to the LLVM installation directory.
+        llvm_passes_lib_dir (str): Path to the LLVM passes library directory.
+        openai_api_key (str): OpenAI API key.
     """
     print(f"Starting processing of Juliet repository at: {juliet_repo_path}\n")
 
@@ -94,6 +77,30 @@ def process_juliet_repo(juliet_repo_path):
     with open(guidance_file, 'r') as json_file:
         guidance = json.load(json_file)
     print("Guidance data successfully loaded.\n")
+
+    # Set LLVM directories for tools
+    tools.LLVM_DIR = llvm_dir
+    tools.LLVM_PASSES_LIB_DIR = llvm_passes_lib_dir
+
+    # Initialize the ChatOpenAI model with the provided OpenAI API key
+    # Moved inside the function to access openai_api_key
+    # Choose the appropriate model
+    MODEL_NAME = "gpt-3.5-turbo-0125"
+    # MODEL_NAME = "gpt-4o-mini-2024-07-18"
+    # MODEL_NAME = "gpt-4o-2024-05-13"
+
+    # Initialize the ChatOpenAI model with desired parameters
+    llm = ChatOpenAI(temperature=0.2, model=MODEL_NAME, openai_api_key=openai_api_key)
+
+    # Bind tools to the language model
+    llm_with_tools = llm.bind_tools(gpt_tool_list)
+
+    # Set up structured output using the ResponseFormatter
+    structured_llm = llm.with_structured_output(ResponseFormatter)
+
+    # Create processing chains
+    classification_chain = CHAT_PROMPT | llm_with_tools
+    structured_decision_chain = CHAT_PROMPT | structured_llm
 
     # Iterate over each SARIF subpath
     for subpath in sarif_subpaths:
@@ -198,17 +205,42 @@ def main():
         required=True,
         help="Path to the Juliet test suite repository."
     )
+    parser.add_argument(
+        "--llvm_dir",
+        type=str,
+        required=True,
+        help="Path to the LLVM installation directory (e.g., /usr/lib/llvm-18/)."
+    )
+    parser.add_argument(
+        "--llvm_passes_lib_dir",
+        type=str,
+        required=True,
+        help="Path to the LLVM passes library directory (e.g., /home/user/llm-false-positive-filtering/llvm/libs)."
+    )
+    parser.add_argument(
+        "--openai_api_key",
+        type=str,
+        required=True,
+        help="OpenAI API key (e.g., sk-...)."
+    )
     args = parser.parse_args()
 
     juliet_repo_path = args.juliet_repo_path
+    llvm_dir = args.llvm_dir
+    llvm_passes_lib_dir = args.llvm_passes_lib_dir
+    openai_api_key = args.openai_api_key
 
     # Validate the provided repository path
     if not os.path.isdir(juliet_repo_path):
         print(f"Error: The provided Juliet repository path does not exist or is not a directory: {juliet_repo_path}")
         sys.exit(1)
 
+    # Set environment variables for LLVM directories
+    os.environ['LLVM_DIR'] = llvm_dir
+    os.environ['LLVM_PASSES_LIB_DIR'] = llvm_passes_lib_dir
+
     # Start processing
-    process_juliet_repo(juliet_repo_path)
+    process_juliet_repo(juliet_repo_path, llvm_dir, llvm_passes_lib_dir, openai_api_key)
 
 if __name__ == "__main__":
     main()

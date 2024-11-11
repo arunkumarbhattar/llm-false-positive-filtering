@@ -34,11 +34,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------
-# Specify the cache directory
-# --------------------------
-cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/codellama'
-
-# --------------------------
 # Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
@@ -47,11 +42,6 @@ bnb_config = BitsAndBytesConfig(
     bnb_8bit_quant_type="nf4",               # Quantization type; "nf4" is recommended for transformers
     bnb_8bit_compute_dtype=torch.float16      # Compute dtype for 8-bit weights
 )
-
-# --------------------------
-# Define save directory
-# --------------------------
-save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_codellama_codeql'
 
 # --------------------------
 # Function to load evaluation data from JSONL file
@@ -183,7 +173,7 @@ def custom_collate_fn(batch):
 # --------------------------
 # Function to evaluate the model
 # --------------------------
-def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=80, seed=None):
+def evaluate_model(model, tokenizer, eval_dataset, output_jsonl, device='cuda', batch_size=1, max_new_tokens=40, num_beams=1, num_samples=80, seed=None):
     """
     Generates completions for a randomly sampled subset of the evaluation dataset,
     extracts unique tool names, compares them against expected tools, computes evaluation metrics,
@@ -193,6 +183,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         model: The language model to be evaluated.
         tokenizer: The tokenizer associated with the model.
         eval_dataset: The evaluation dataset containing 'prompt' and 'completion' fields.
+        output_jsonl (str): Path to save evaluation details.
         device (str): The device to run the model on ('cuda' or 'cpu').
         batch_size (int): The batch size for evaluation.
         max_new_tokens (int): The maximum number of new tokens to generate.
@@ -267,7 +258,7 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
     eval_dataloader = DataLoader(
         eval_subset,
         batch_size=batch_size,
-        collate_fn=custom_collate_fn  # Ensure this function is defined elsewhere in your script
+        collate_fn=custom_collate_fn
     )
 
     # --------------------------
@@ -297,11 +288,6 @@ def evaluate_model(model, tokenizer, eval_dataset, device='cuda', batch_size=1, 
         "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id
     }
-
-    # --------------------------
-    # Define the output JSONL file
-    # --------------------------
-    output_jsonl = 'evaluation_details.jsonl'
 
     # --------------------------
     # Remove existing JSONL file if it exists to avoid appending to old data
@@ -508,9 +494,18 @@ def parse_arguments():
     parser.add_argument('--retrain', action='store_true', help='Retrain the model even if a saved model exists.')
     parser.add_argument('--only_eval', action='store_true', help='Perform only evaluation without training.')
     parser.add_argument('--train', action='store_true', help='Perform training.')
+
+    # New arguments
+    parser.add_argument('--cache_dir', type=str, default=None, help='Path to the cache directory for the model.')
+    parser.add_argument('--save_directory', type=str, required=True, help='Directory to save or load the trained model.')
+    parser.add_argument('--data_path', type=str, help='Path to the training data JSONL file.')
+    parser.add_argument('--eval_data_path', type=str, help='Path to the evaluation data JSONL file.')
+    parser.add_argument('--output_jsonl', type=str, default='evaluation_details.jsonl', help='Path to save evaluation details JSONL file.')
+
     # Parse the arguments
     args = parser.parse_args()
     return args
+
 # --------------------------
 # Main Execution Flow
 # --------------------------
@@ -522,14 +517,18 @@ def main():
         logger.info("Only evaluation mode activated. Skipping training and interactive modes.")
 
         # Ensure that a saved model exists
-        if not os.path.exists(save_directory):
-            logger.error(f"Save directory '{save_directory}' does not exist. Cannot perform evaluation.")
+        if not os.path.exists(args.save_directory):
+            logger.error(f"Save directory '{args.save_directory}' does not exist. Cannot perform evaluation.")
+            exit(1)
+
+        if args.eval_data_path is None:
+            logger.error("Evaluation data path (--eval_data_path) is required for evaluation.")
             exit(1)
 
         # Load the base model
         model = AutoModelForCausalLM.from_pretrained(
             "Phind/Phind-CodeLlama-34B-v2",
-            cache_dir=cache_dir,
+            cache_dir=args.cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,
@@ -537,14 +536,14 @@ def main():
         )
 
         # Load the LoRA adapters
-        model = PeftModel.from_pretrained(model, save_directory)
+        model = PeftModel.from_pretrained(model, args.save_directory)
         model.eval()
         model.config.use_cache = True
 
         # Load the tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             "Phind/Phind-CodeLlama-34B-v2",
-            cache_dir=cache_dir,
+            cache_dir=args.cache_dir,
             padding_side='left'
         )
 
@@ -555,7 +554,7 @@ def main():
         # --------------------------
         # Load the Evaluation Dataset
         # --------------------------
-        eval_data_path = 'eval_prompt_completion.jsonl'
+        eval_data_path = args.eval_data_path
         eval_data = load_eval_jsonl(eval_data_path)
         eval_dataset = Dataset.from_dict(eval_data)
 
@@ -593,6 +592,7 @@ def main():
             model=model,
             tokenizer=tokenizer,
             eval_dataset=tokenized_eval_dataset,
+            output_jsonl=args.output_jsonl,
             device='cuda',
             batch_size=1,
             max_new_tokens=40,
@@ -606,15 +606,15 @@ def main():
         exit(0)  # Exit after evaluation
 
     if args.interactive:
-        if not os.path.exists(save_directory):
-            logger.error(f"Save directory '{save_directory}' does not exist. Cannot enter interactive mode.")
+        if not os.path.exists(args.save_directory):
+            logger.error(f"Save directory '{args.save_directory}' does not exist. Cannot enter interactive mode.")
             exit(1)
-        logger.info(f"Loading the trained model from '{save_directory}' for interactive chat.")
+        logger.info(f"Loading the trained model from '{args.save_directory}' for interactive chat.")
 
         # Load the base model
         model = AutoModelForCausalLM.from_pretrained(
             "Phind/Phind-CodeLlama-34B-v2",
-            cache_dir=cache_dir,
+            cache_dir=args.cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
@@ -622,14 +622,14 @@ def main():
         )
 
         # Load the LoRA adapters using PeftModel.from_pretrained
-        model = PeftModel.from_pretrained(model, save_directory)
+        model = PeftModel.from_pretrained(model, args.save_directory)
         model.eval()
         model.config.use_cache = True
 
         # Load the tokenizer from the base model
         tokenizer = AutoTokenizer.from_pretrained(
             "Phind/Phind-CodeLlama-34B-v2",
-            cache_dir=cache_dir,
+            cache_dir=args.cache_dir,
             padding_side='left'
         )
 
@@ -669,7 +669,10 @@ def main():
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_eval_jsonl('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
+        if args.data_path is None:
+            logger.error("Data path (--data_path) is required for training.")
+            exit(1)
+        data = load_eval_jsonl(args.data_path)
         dataset = Dataset.from_dict(data)
 
         # --------------------------
@@ -688,10 +691,9 @@ def main():
         # --------------------------
         # Load the tokenizer
         # --------------------------
-        model_id = 'Phind/Phind-CodeLlama-34B-v2'
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
+            "Phind/Phind-CodeLlama-34B-v2",
+            cache_dir=args.cache_dir,
             padding_side='left'
         )
 
@@ -747,13 +749,13 @@ def main():
         # --------------------------
         # Check if a saved model exists and load it if not retraining
         # --------------------------
-        if os.path.exists(save_directory) and not args.retrain:
-            logger.info(f"Found a saved model in '{save_directory}'. Loading the model and skipping training.")
+        if os.path.exists(args.save_directory) and not args.retrain:
+            logger.info(f"Found a saved model in '{args.save_directory}'. Loading the model and skipping training.")
 
             # Load the base model
             model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                cache_dir=cache_dir,
+                "Phind/Phind-CodeLlama-34B-v2",
+                cache_dir=args.cache_dir,
                 device_map='auto',
                 torch_dtype=torch.float16,
                 quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
@@ -761,7 +763,7 @@ def main():
             )
 
             # Load the LoRA adapters using PeftModel.from_pretrained
-            model = PeftModel.from_pretrained(model, save_directory)
+            model = PeftModel.from_pretrained(model, args.save_directory)
             model.eval()
             model.config.use_cache = True
 
@@ -770,8 +772,8 @@ def main():
 
             # Load the base model with quantization_config
             model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                cache_dir=cache_dir,
+                "Phind/Phind-CodeLlama-34B-v2",
+                cache_dir=args.cache_dir,
                 device_map='auto',
                 torch_dtype=torch.float16,
                 quantization_config=bnb_config,    # Use quantization_config instead of load_in_8bit=True
@@ -895,9 +897,9 @@ def main():
             # --------------------------
             # Save the LoRA adapters
             # --------------------------
-            os.makedirs(save_directory, exist_ok=True)
-            model.save_pretrained(save_directory)
-            print(f"Model saved to '{save_directory}'")
+            os.makedirs(args.save_directory, exist_ok=True)
+            model.save_pretrained(args.save_directory)
+            print(f"Model saved to '{args.save_directory}'")
 
 
 if __name__ == "__main__":

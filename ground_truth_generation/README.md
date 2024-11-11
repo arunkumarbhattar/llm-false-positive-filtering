@@ -29,5 +29,21 @@ Before using the toolkit, ensure that the following tools and dependencies are i
 
 # Installation
 
-Download the juliet repo 
+Download the juliet repo from google drive 
+
+# Usage 
+
+dataset_juliet.py 
+```aiignore
+specify --base_dir flag ->which is base directory of  juliet repo
+```
+
+add_ground_truth.py
+```aiignore
+base_dir is juliet repo
+sarif_input is cpp.sarif (already in juliet repo base dir)
+tags_file is tags (already in juliet repo base dir)
+sarif_output (your wish any name you can provide) 
+```
+
 

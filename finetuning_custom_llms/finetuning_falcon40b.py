@@ -29,21 +29,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------
-# Specify the cache directory
-# --------------------------
-cache_dir = '/scratch/gilbreth/bhattar1/.cache/huggingface/transformers/falcon'
-
-# --------------------------
 # Define quantization configuration using BitsAndBytesConfig for 8-bit QLoRA
 # --------------------------
 bnb_config = BitsAndBytesConfig(
     load_in_8bit=True
 )
-
-# --------------------------
-# Define save directory
-# --------------------------
-save_directory = '/scratch/gilbreth/bhattar1/transformers/saved_falcon_codeql'
 
 # --------------------------
 # Function to load JSONL data with reasoning
@@ -154,6 +144,13 @@ def parse_arguments():
     parser.add_argument('--only_eval', action='store_true', help='Perform only evaluation without training.')
     parser.add_argument('--train', action='store_true', help='Perform training.')
 
+    # New arguments
+    parser.add_argument('--cache_dir', type=str, default=None, help='Path to the cache directory for the model.')
+    parser.add_argument('--save_directory', type=str, required=True, help='Directory to save or load the trained model.')
+    parser.add_argument('--data_path', type=str, help='Path to the training data JSONL file.')
+    parser.add_argument('--eval_data_path', type=str, help='Path to the evaluation data JSONL file.')
+    parser.add_argument('--output_jsonl', type=str, default='evaluation_details.jsonl', help='Path to save evaluation details JSONL file.')
+
     # Parse the arguments
     args = parser.parse_args()
     return args
@@ -165,22 +162,29 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
+    model_id = 'tiiuae/falcon-40b-instruct'  # Do not disturb the model ID
+
     if args.only_eval:
-        # Evaluation code
+        # Evaluation code (not implemented in this snippet)
+        logger.info("Only evaluation mode activated. Skipping training and interactive modes.")
         exit(0)
 
     elif args.interactive:
-        # Interactive code
+        # Interactive code (not implemented in this snippet)
+        logger.info("Interactive mode activated. Loading model for interactive chat.")
         exit(0)
 
-    else:
+    elif args.train:
         # Proceed to training
         print("Proceeding to training...")
 
         # --------------------------
         # Load your training data
         # --------------------------
-        data = load_jsonl_with_reasoning('../prompt_pair_prepping/fine_tuning_training_data.jsonl')
+        if args.data_path is None:
+            logger.error("Data path (--data_path) is required for training.")
+            exit(1)
+        data = load_jsonl_with_reasoning(args.data_path)
         dataset = Dataset.from_dict(data)
 
         # --------------------------
@@ -199,18 +203,11 @@ def main():
         eval_dataset = eval_dataset.shuffle(seed=42).select(range(int(0.15 * len(eval_dataset))))
 
         # --------------------------
-        # Dump prompt and completion pairs to JSONL files
-        # --------------------------
-        dump_prompt_completion(train_dataset, 'train_prompt_completion_falcon.jsonl')
-        dump_prompt_completion(eval_dataset, 'eval_prompt_completion_falcon.jsonl')
-
-        # --------------------------
         # Load the tokenizer
         # --------------------------
-        model_id = 'tiiuae/falcon-40b-instruct'
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
-            cache_dir=cache_dir,
+            cache_dir=args.cache_dir,
             padding_side='left'
         )
 
@@ -252,7 +249,7 @@ def main():
         # --------------------------
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            cache_dir=cache_dir,
+            cache_dir=args.cache_dir,
             device_map='auto',
             torch_dtype=torch.float16,
             quantization_config=bnb_config,
@@ -297,20 +294,20 @@ def main():
         # Define training arguments with adjustments for faster training
         # --------------------------
         training_args = TrainingArguments(
-            output_dir='./fine_tuned_model',
-            per_device_train_batch_size=1,   # Smaller batch size to fit in memory
+            output_dir=args.save_directory,       # Use save_directory from args
+            per_device_train_batch_size=1,        # Smaller batch size to fit in memory
             per_device_eval_batch_size=1,
-            gradient_accumulation_steps=1,   # No accumulation for simplicity
-            num_train_epochs=2,              # Only 1 epoch for quick training
-            learning_rate=1e-4,              # Slightly higher learning rate
-            logging_steps=1000,              # Less frequent logging
-            save_strategy="no",              # Disable checkpoint saving
-            evaluation_strategy="no",        # Disable evaluation during training
-            fp16=True,                       # Use mixed precision
-            optim="adamw_torch",             # Optimizer
-            lr_scheduler_type="linear",      # Learning rate scheduler
-            warmup_steps=0,                  # No warmup
-            report_to="none",                # Disable reporting
+            gradient_accumulation_steps=1,        # No accumulation for simplicity
+            num_train_epochs=2,                   # Only 2 epochs for quick training
+            learning_rate=1e-4,                   # Slightly higher learning rate
+            logging_steps=1000,                   # Less frequent logging
+            save_strategy="no",                   # Disable checkpoint saving
+            evaluation_strategy="no",             # Disable evaluation during training
+            fp16=True,                            # Use mixed precision
+            optim="adamw_torch",                  # Optimizer
+            lr_scheduler_type="linear",           # Learning rate scheduler
+            warmup_steps=0,                       # No warmup
+            report_to="none",                     # Disable reporting
         )
 
         # --------------------------
@@ -340,9 +337,13 @@ def main():
         # --------------------------
         # Save the LoRA adapters
         # --------------------------
-        os.makedirs(save_directory, exist_ok=True)
-        model.save_pretrained(save_directory)
-        print(f"Model saved to '{save_directory}'")
+        os.makedirs(args.save_directory, exist_ok=True)
+        model.save_pretrained(args.save_directory)
+        print(f"Model saved to '{args.save_directory}'")
+
+    else:
+        print("Please specify an action: --train, --only_eval, or --interactive")
+        exit(1)
 
 if __name__ == "__main__":
     main()

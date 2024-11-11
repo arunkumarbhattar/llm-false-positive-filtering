@@ -13,12 +13,13 @@ llm-false-positive-filtering/
 │   ├── config.py
 │   ├── finetuning_codellama.py
 │   ├── finetuning_codellama_with_reasoning.py
-│   └── finetuning.py
+│   ├── finetuning_falcon40b.py
+│   ├── finetuning_mistral22B.py
+│   └── fine_tuning_training_data.jsonl
 ├── ground_truth_generation/
 │   ├── add_ground_truth.py
 │   ├── dataset_juliet.py
 │   ├── filter.sh
-│   ├── parse.py
 │   └── README.md
 ├── llvm/
 │   ├── build/
@@ -32,16 +33,15 @@ llm-false-positive-filtering/
 │   ├── dataset.py
 │   ├── fine_tuning_training_data.jsonl
 │   ├── guidance.json
-│   ├── langchain-player.py
 │   ├── llm_triage.py
 │   ├── prompts.py
 │   ├── repository_manager.py
 │   └── tools.py
 ├── __pycache__/
-├── prepare-codeql-tests.sh
 ├── README.md
-├── requirements_for_ground_truth_generation.txt
+├── requirements.txt
 └── venv/
+
 
 ```
 
@@ -53,6 +53,12 @@ At this moment, the custom fine-tuned LLMs do not invoke the tool itself, but th
 Incorporating the logic to automatically call the tools and verify output from tools is only done by OpenAI GPT-4o and not these custom finetuned LLMs at the moment.
 However, in future we will do it!
 
+```aiignore
+python script_name.py --train/--retrain/--only_eval --data_path /path/to/training_data.jsonl --save_directory /path/to/save_model --cache_dir /path/to/cache_dir
+
+
+save_directory should contain the adapters for saved model. From the google drive , make sure you copy the exact model directory for each model
+```
 
 ### finetuning scripts -->
 
@@ -68,6 +74,15 @@ In general the scripts employ the following pipeling -->
 ## directory --> prompt_pair_prepping
 
 ### data_prepping_all_facts_from_openai.py
+
+#### Usage: 
+```aiignore
+python data_prepping_all_facts_from_openai.py \
+    --openai_api_key YOUR_OPENAI_API_KEY \
+    --repo_path /path/to/juliet_repo \
+    --output_file fine_tuning_training_data.jsonl
+
+```
 #### Purpose: 
 Automate the process of gather and preprocessing factual data from OpenAI sources. This data will eventually be used in training LLMs.
 
@@ -118,27 +133,20 @@ Functionality:
         Functions to retrieve function definitions, dump source code snippets, and interact with LLVM tools for deeper code analysis.
 
 ### llm_triage.py
+#### Usage: 
+
+```aiignore
+--juliet_repo_path
+
+--llvm_dir
+/usr/lib/llvm-18/
+--llvm_passes_lib_dir
+    --> this is the llvm/libs directory
+--openai_api_key
+```
 #### Purpose:
 
     Basically godfather of all scripts. Use chatgpt LLM to make decide which tools to use, and based on tool, invoke that LLM took and make the bug prediction as TP or FP.
 
 
-Acts as the central script for adapting the LLM to the specific task of triaging CodeQL alerts. By managing both the training and interactive aspects, it ensures that the model can be fine-tuned effectively and utilized seamlessly within different operational modes, enhancing the project's ability to filter false positives accurately.
-
-## Step 1: Compile LLVM Passes
-Refer to `llvm/README.md` for detailed instructions on how to compile the necessary LLVM passes.
-Then set the environment variable
-``` bash
-export LLVM_PASSES_LIB_DIR=/path/to/llm-sast-triage/llvm/build/lib
-```
-
-## Step 2: Run the LLM
-To analyze warnings in a repository, provide the following inputs:
-- Path to the repository
-- CodeQL SARIF file
-- LLVM bitcode file
-
-### Usage:
-```bash
-python3 llm_triage.py <repo_path> <sarif_path> <bitcode_path>
-```
+    Acts as the central script for adapting the LLM to the specific task of triaging CodeQL alerts. By managing both the training and interactive aspects, it ensures that the model can be fine-tuned effectively and utilized seamlessly within different operational modes, enhancing the project's ability to filter false positives accurately.
