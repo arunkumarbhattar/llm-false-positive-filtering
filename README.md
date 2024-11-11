@@ -12,7 +12,6 @@ llm-false-positive-filtering/
 ├── finetuning_custom_llms/
 │   ├── config.py
 │   ├── finetuning_codellama.py
-│   ├── finetuning_codellama_with_reasoning.py
 │   ├── finetuning_falcon40b.py
 │   ├── finetuning_mistral22B.py
 │   └── fine_tuning_training_data.jsonl
