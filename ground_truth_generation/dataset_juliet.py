@@ -245,7 +245,7 @@ def main():
     tags = parse_tagfile('tags.txt')
 
     # Parse the CodeQL SARIF file to extract relevant results
-    codeql_results = parse_codeql_sarif("cpp.sarif", "cpp/uninitialized-local")
+    codeql_results = parse_codeql_sarif("cpp.sarif", None)
 
     # Build the dataset by mapping CodeQL results to function code and ground truth labels
     ds = build_dataset(tags, codeql_results)

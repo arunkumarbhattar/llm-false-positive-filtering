@@ -45,8 +45,8 @@ class ResponseFormatter(BaseModel):
 
 # Choose the appropriate model
 
-#MODEL_NAME="gpt-3.5-turbo-0125"
-MODEL_NAME="gpt-4o-mini-2024-07-18"
+MODEL_NAME="gpt-3.5-turbo-0125"
+#MODEL_NAME="gpt-4o-mini-2024-07-18"
 #MODEL_NAME="gpt-4o-2024-05-13"
 
 # Initialize the ChatOpenAI model with desired parameters
