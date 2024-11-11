@@ -632,7 +632,7 @@ def main():
         # --------------------------
         # Perform Evaluation
         # --------------------------
-        num_samples = 20
+        num_samples = 80
         evaluation_results, generated_completions, reference_completions, prompts = evaluate_model(
             model=model,
             tokenizer=tokenizer,

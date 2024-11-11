@@ -56,8 +56,14 @@ However, in future we will do it!
 ```aiignore
 python script_name.py --train/--retrain/--only_eval --data_path /path/to/training_data.jsonl --save_directory /path/to/save_model --cache_dir /path/to/cache_dir
 
-
+--access_token will be required for mistral model (hugging face) -->  
 save_directory should contain the adapters for saved model. From the google drive , make sure you copy the exact model directory for each model
+
+--eval_data_path will also be be required if you are only running evaluation later on.
+
+Once you finished running training, you will see new .jsonl file generated that basically contain the evaluation and training data
+
+use that file for this path
 ```
 
 ### finetuning scripts -->
