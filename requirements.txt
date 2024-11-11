@@ -114,7 +114,7 @@ pytz==2024.1
 pyxdg==0.28
 PyYAML==6.0.1
 regex==2024.9.11
-requests==2.31.0
+requests==2.32.2
 requests-toolbelt==1.0.0
 rich==13.7.1
 safetensors==0.4.5
